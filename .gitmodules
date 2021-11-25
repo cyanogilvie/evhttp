@@ -1,0 +1,8 @@
+[submodule "deps/fmt"]
+	path = deps/fmt
+	url = https://github.com/fmtlib/fmt
+	branch = 8.0.1
+[submodule "deps/re2c"]
+	path = deps/re2c
+	url = https://github.com/skvadrik/re2c
+	branch = 7c6b5c95

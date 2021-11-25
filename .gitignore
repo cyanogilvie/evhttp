@@ -1,0 +1,11 @@
+core
+*.swp
+build
+local
+*.o
+serv.c
+http_headers.c
+serv
+dbg_serv
+deps/libev
+tags

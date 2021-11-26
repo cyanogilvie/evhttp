@@ -3,16 +3,16 @@
 
 extern "C" {
 
-#define FAKE_TEMPLATE_APPEND_INT(type) \
-	size_t fmt_obstack_append_#type(struct obstack* ob, #type val) \
+#define FAKE_TEMPLATE_APPEND_INT(func, type) \
+	size_t func(struct obstack* ob, type val) \
 	{ \
 		auto fi = fmt::format_int(val); \
-		obstack_grow(ob, fi->data, fi->size); \
-		return fi.size; \
+		obstack_grow(ob, fi.data(), fi.size()); \
+		return fi.size(); \
 	}
 
-FAKE_TEMPLATE_APPEND_INT(int);
-FAKE_TEMPLATE_APPEND_INT(size_t);
+FAKE_TEMPLATE_APPEND_INT(fmt_obstack_append_int,	int);
+FAKE_TEMPLATE_APPEND_INT(fmt_obstack_append_size_t,	size_t);
 
 }
 

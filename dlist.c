@@ -1,7 +1,9 @@
+#include <stddef.h>
 #include "dlist.h"
 
-void dlist_prepend(struct dlist* dlist, void* elemPtr) //<<<
+void dlist_prepend(void* dlistPtr, void* elemPtr) //<<<
 {
+	struct dlist*		dlist = dlistPtr;
 	struct dlist_elem*	elem = elemPtr;
 
 	if (dlist->head) {
@@ -16,8 +18,9 @@ void dlist_prepend(struct dlist* dlist, void* elemPtr) //<<<
 }
 
 //>>>
-void dlist_append(struct dlist* dlist, void* elemPtr) //<<<
+void dlist_append(void* dlistPtr, void* elemPtr) //<<<
 {
+	struct dlist*		dlist = dlistPtr;
 	struct dlist_elem*	elem = elemPtr;
 
 	if (dlist->tail) {
@@ -32,8 +35,32 @@ void dlist_append(struct dlist* dlist, void* elemPtr) //<<<
 }
 
 //>>>
-void* dlist_pop_head(struct dlist* dlist) //<<<
+void dlist_remove(void* dlistPtr, void* elemPtr) //<<<
 {
+	struct dlist*		dlist = dlistPtr;
+	struct dlist_elem*	elem = elemPtr;
+
+	if (elem->prev) {
+		struct dlist_elem*	elem_prev = elem->prev;
+		elem_prev->next = elem->next;
+	} else {
+		// elem was the head
+		dlist->head = elem->next;
+	}
+
+	if (elem->next) {
+		struct dlist_elem*	elem_next = elem->next;
+		elem_next->prev = elem->prev;
+	} else {
+		// elem was the tail
+		dlist->tail = elem->prev;
+	}
+}
+
+//>>>
+void* dlist_pop_head(void* dlistPtr) //<<<
+{
+	struct dlist*	dlist = dlistPtr;
 	struct dlist_elem*	elem = NULL;
 
 	if (dlist->head) {
@@ -49,8 +76,9 @@ void* dlist_pop_head(struct dlist* dlist) //<<<
 }
 
 //>>>
-void* dlist_pop_tail(struct dlist* dlist) //<<<
+void* dlist_pop_tail(void* dlistPtr) //<<<
 {
+	struct dlist*		dlist = dlistPtr;
 	struct dlist_elem*	elem = NULL;
 
 	if (dlist->tail) {
@@ -66,14 +94,16 @@ void* dlist_pop_tail(struct dlist* dlist) //<<<
 }
 
 //>>>
-void* dlist_head(struct dlist* dlist) //<<<
+void* dlist_head(void* dlistPtr) //<<<
 {
+	struct dlist*	dlist = dlistPtr;
 	return dlist->head;
 }
 
 //>>>
-void* dlist_tail(struct dlist* dlist) //<<<
+void* dlist_tail(void* dlistPtr) //<<<
 {
+	struct dlist*	dlist = dlistPtr;
 	return dlist->tail;
 }
 

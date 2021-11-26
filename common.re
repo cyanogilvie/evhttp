@@ -5,11 +5,13 @@
 /*!rules:re2c:basic
 	!use:common;
 	re2c:eof				= -1;
+	re2c:flags:tags			= 1;
 	re2c:yyfill:check		= 0;
 	re2c:define:YYCTYPE		= "unsigned char";
 	re2c:define:YYCURSOR	= "s";
 	re2c:define:YYGETSTATE	= "-1";
 	re2c:define:YYSETSTATE	= "";
+	re2c:define:YYMARKER	= "mar";
 	re2c:define:YYFILL		= "";
 	re2c:tags:expression	= "@@";
 

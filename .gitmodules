@@ -5,4 +5,8 @@
 [submodule "deps/re2c"]
 	path = deps/re2c
 	url = https://github.com/skvadrik/re2c
-	branch = 7c6b5c95
+	branch = 5ac98bc
+[submodule "deps/smhasher"]
+	path = deps/smhasher
+	url = https://github.com/aappleby/smhasher.git
+	branch = 61a0530f

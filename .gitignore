@@ -3,9 +3,15 @@ core
 build
 local
 *.o
-serv.c
 http_headers.c
+msg.c
+report.c
 serv
+fmttest
 dbg_serv
 deps/libev
 tags
+MurmurHash3.cc
+MurmurHash3.h
+deps
+re2c

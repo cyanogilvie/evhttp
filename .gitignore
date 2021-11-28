@@ -13,5 +13,4 @@ deps/libev
 tags
 MurmurHash3.cc
 MurmurHash3.h
-deps
 re2c

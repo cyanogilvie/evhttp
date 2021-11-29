@@ -35,6 +35,8 @@ struct con_state {
 	int					body_fd;		// tmpfile fd if body_storage == BODY_STORAGE_MMAP
 	ssize_t				chunk_remain;
 
+	struct dlist		write_jobs;		// dlist of pending write jobs to this connection
+
 	// Lexer state
 	unsigned char*		cur;
 	unsigned char*		mar;
@@ -59,11 +61,13 @@ enum con_status parse_http_message(struct con_state* c) //<<<
 {
 	unsigned int		yych, yyaccept;
     const unsigned char *h1, *h2, *h3, *h4, *m1, *m2, *v1, *v2, *r1, *r2, *st1, *l1, *l2, *l3, *l4, *l5, *l6, *end;
-	struct mtag			*f1, *f2, *p1, *p2, *p3, *p4;
+	struct mtag			*p1, *p2, *p3, *p4;
+	unsigned char*restrict	s = c->cur;
+	enum con_status		status = CON_STATUS_UNDEF;
 
 	/*!getstate:re2c:http*/
 loop:
-	c->tok = c->cur;
+	c->tok = s;
 	/*!re2c:http
 		!use:common;
 		re2c:eof						= 0;
@@ -71,15 +75,15 @@ loop:
 		re2c:flags:case-insensitive		= 1;
 		re2c:tags:expression			= "c->@@";
 		re2c:define:YYCTYPE				= "unsigned char";
-		re2c:define:YYCURSOR			= "c->cur";
+		re2c:define:YYCURSOR			= "s";
 		re2c:define:YYMARKER			= "c->mar";
 		re2c:define:YYLIMIT				= "c->lim";
 		re2c:define:YYGETSTATE			= "c->state";
 		re2c:define:YYSETSTATE			= "c->state = @@;";
-		re2c:define:YYFILL				= "return CON_STATUS_WAITING;";
+		re2c:define:YYFILL				= "status = CON_STATUS_WAITING; goto finally;";
 		re2c:define:YYGETCONDITION		= "c->cond";
 		re2c:define:YYSETCONDITION		= "c->cond = @@;";
-		re2c:define:YYMTAGP				= "mtag(&@@{tag}, c->tok, c->cur, &c->mtp);";
+		re2c:define:YYMTAGP				= "mtag(&@@{tag}, c->tok, s, &c->mtp);";
 		re2c:define:YYMTAGN				= "mtag(&@@{tag}, c->tok, NULL, &c->mtp);";
 		re2c:define:YYCONDTYPE			= "msg_cond_type";
 
@@ -120,30 +124,6 @@ loop:
 		}
 		// Request line (server) >>>
 
-		// Unfolding <<<
-		<header,trailer> header_field_folded crlf	{
-			// Overwrite all obs_fold with equivalent number of sp chars and reparse
-#if 0
-			printf("header (folded): (%.*s) => (%.*s)\n",
-					(int)(h2 - h1), h1,
-					(int)(h4 - h3), h3);
-#endif
-
-			struct mtag*	start	= f1;
-			struct mtag*	end		= f2;
-
-			while (start && end) {
-				memset(c->tok + start->dist, ' ', end->dist - start->dist);
-				start = start->prev;
-				end = end->prev;
-			}
-
-			c->cur = c->tok;
-			c->mar = c->tok;
-			goto loop;
-		}
-		// Unfolding >>>
-
 		// Ignore trailer forbidden headers <<<
 		trailer_forbidden
 			= "Content-Type"
@@ -178,19 +158,14 @@ loop:
 			ssize_t					content_length = 0;
 			const unsigned char*	digit = l1;
 
-#if 0
-			printf("content-length: (%.*s)\n", (int)(l2 - l1), l1);
-#endif
-
 			while (digit < l2) {
 				content_length *= 10;
 				content_length += *digit++ - '0';
-				if (content_length < 0) return CON_STATUS_ERROR; // Overflow
+				if (content_length < 0) {
+					status = CON_STATUS_ERROR; // Overflow
+					goto finally;
+				}
 			}
-
-#if 0
-			printf("Decoded content-length: %ld\n", content_length);
-#endif
 
 			// Invalid to have multiple Content-Length headers with different values
 			if (
@@ -202,7 +177,8 @@ loop:
 				} else {
 					// TODO: MUST close the connection and discard this message
 				}
-				return CON_STATUS_ERROR;
+				status = CON_STATUS_ERROR;
+				goto finally;
 			}
 
 			struct header* h = new_header(c->ob);
@@ -215,23 +191,23 @@ loop:
 		// Content-Length: >>>
 		// Transfer-Encoding: <<<
 		<header> "Transfer-Encoding:" ows (',' ows)*	:=> te
-		<te> ows       "chunked"  ows / (',' | crlf)	{ if (push_te(c, TE_CHUNKED))	return CON_STATUS_ERROR; goto yyc_te; }
-		<te> ows "x-"? "compress" ows / (',' | crlf)	{ if (push_te(c, TE_COMPRESS))	return CON_STATUS_ERROR; goto yyc_te; }
-		<te> ows       "deflate"  ows / (',' | crlf)	{ if (push_te(c, TE_DEFLATE))	return CON_STATUS_ERROR; goto yyc_te; }
-		<te> ows "x-"? "gzip"     ows / (',' | crlf)	{ if (push_te(c, TE_GZIP))		return CON_STATUS_ERROR; goto yyc_te; }
+		<te> ows       "chunked"  ows / (',' | crlf)	{ if (push_te(c, TE_CHUNKED))	{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te; }
+		<te> ows "x-"? "compress" ows / (',' | crlf)	{ if (push_te(c, TE_COMPRESS))	{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te; }
+		<te> ows       "deflate"  ows / (',' | crlf)	{ if (push_te(c, TE_DEFLATE))	{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te; }
+		<te> ows "x-"? "gzip"     ows / (',' | crlf)	{ if (push_te(c, TE_GZIP))		{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te; }
 		<te> ows       "identity" ows / (',' | crlf)	{ goto yyc_te; }
 		<te> crlf							=> header	{ goto loop; }
-		<te> *											{ fprintf(stderr, "Unsupported Transfer-Encoding\n"); return CON_STATUS_ERROR; }
+		<te> *											{ fprintf(stderr, "Unsupported Transfer-Encoding\n"); status = CON_STATUS_ERROR; goto finally; }
 		// Transfer-Encoding: >>>
 		// TE: <<<
 		<header> "TE:" ows (',' ows)*	:=> te_accept
-		<te_accept> ows       "trailers"            ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_TRAILERS))	return CON_STATUS_ERROR; goto yyc_te_accept; }
-		<te_accept> ows "x-"? "compress" t_ranking? ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_COMPRESS))	return CON_STATUS_ERROR; goto yyc_te_accept; }
-		<te_accept> ows       "deflate"  t_ranking? ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_DEFLATE))	return CON_STATUS_ERROR; goto yyc_te_accept; }
-		<te_accept> ows "x-"? "gzip"     t_ranking? ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_GZIP))		return CON_STATUS_ERROR; goto yyc_te_accept; }
+		<te_accept> ows       "trailers"            ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_TRAILERS))	{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te_accept; }
+		<te_accept> ows "x-"? "compress" t_ranking? ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_COMPRESS))	{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te_accept; }
+		<te_accept> ows       "deflate"  t_ranking? ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_DEFLATE))	{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te_accept; }
+		<te_accept> ows "x-"? "gzip"     t_ranking? ows / (',' | crlf)		{ if (push_te_accept(c, r1, r2, TE_GZIP))		{status = CON_STATUS_ERROR; goto finally;}; goto yyc_te_accept; }
 		<te_accept> ows token (ows ';' ows transfer_parameter)*				{ goto yyc_te_accept; }
 		<te_accept> crlf										=> header	{ goto loop; }
-		<te_accept> *														{ fprintf(stderr, "Unsupported Transfer-Encoding\n"); return CON_STATUS_ERROR; }
+		<te_accept> *														{ fprintf(stderr, "Unsupported Transfer-Encoding\n"); status = CON_STATUS_ERROR; goto finally; }
 		// TE: >>>
 		// Set-Cookie: <<<
 		extension_av		= [\x20-\x7E] \ ';';
@@ -274,7 +250,7 @@ loop:
 			for (unsigned const char* d=l1; d<l2; d++) {
 				acc *= 10;
 				acc += *d - '0';
-				if (acc < 0) return CON_STATUS_ERROR;	// Overflow
+				if (acc < 0) {status = CON_STATUS_ERROR; goto finally;}	// Overflow
 			}
 			c->set_cookies->max_age = acc;
 			goto yyc_cookie_av_end;
@@ -330,7 +306,7 @@ loop:
 		// Upgrade: >>>
 		// Content-Type: <<<
 		<header> "Content-Type:" ows media_type ows crlf	{
-			if (c->headers.first[HDR_CONTENT_TYPE]) return CON_STATUS_ERROR;
+			if (c->headers.first[HDR_CONTENT_TYPE]) {status = CON_STATUS_ERROR; goto finally;}
 			struct media_type*	content_type = obstack_alloc(c->ob, sizeof *content_type);
 			content_type->media_type = obstack_copy0(c->ob, l1, (int)(l2-l1));
 			lowercase(content_type->media_type);
@@ -368,14 +344,14 @@ loop:
 		// Host: <<<
 		<header> "Host:" :=> host
 		<host> ows @l1 host (':' port)? @l2 ows crlf	=> header {
-			if (c->headers.first[HDR_HOST]) return CON_STATUS_ERROR;
+			if (c->headers.first[HDR_HOST]) {status = CON_STATUS_ERROR; goto finally;}
 			new_header_str(c, HDR_HOST, l1, (int)(l2-l1));
 			goto loop;
 		}
 		// Host: >>>
 		// User-Agent: <<<
 		<header> "User-Agent:" ows @l1 field_value @l2 ows crlf		{
-			if (c->headers.first[HDR_USER_AGENT]) return CON_STATUS_ERROR;
+			if (c->headers.first[HDR_USER_AGENT]) {status = CON_STATUS_ERROR; goto finally;}
 			new_header_str(c, HDR_USER_AGENT, l1, (int)(l2-l1));
 			goto loop;
 		}
@@ -394,8 +370,8 @@ loop:
 		}
 		// Generic header handling >>>
 
-		<header>  crlf	{ mtagpool_clear(&c->mtp, c); return CON_STATUS_BODY; }
-		<trailer> crlf	{ return CON_STATUS_BODY_DONE; }
+		<header>  crlf	{ mtagpool_clear(&c->mtp, c); status = CON_STATUS_BODY; goto finally; }
+		<trailer> crlf	{ status = CON_STATUS_BODY_DONE; goto finally; }
 
 
 		// Transfer coding chunked <<<
@@ -417,7 +393,7 @@ loop:
 				else if (ch > 'A')	chunklen += ch - 'A';
 				else				chunklen += ch - '0';
 
-				if (chunklen < 0) return CON_STATUS_ERROR; // Overflow
+				if (chunklen < 0) {status = CON_STATUS_ERROR; goto finally;} // Overflow
 			}
 			// Decode hex chunk length >>>
 
@@ -456,14 +432,16 @@ loop:
 
 							if (-1 == ftruncate(c->body_fd, new_size)) {
 								perror("Error calling ftruncate to expand the body tmpfile");
-								return CON_STATUS_ERROR;
+								status = CON_STATUS_ERROR;
+								goto finally;
 							}
 
 							void*	new = mremap(c->body, c->body_avail, new_size, MREMAP_MAYMOVE);
 
 							if (new == MAP_FAILED) {
 								perror("Error growing body mmap");
-								return CON_STATUS_ERROR;
+								status = CON_STATUS_ERROR;
+								goto finally;
 							}
 							c->body = new;
 							c->body_avail = new_size;
@@ -471,7 +449,8 @@ loop:
 						break;
 					default:
 						fprintf(stderr, "Invalid body_storage: %d\n", c->body_storage);
-						return CON_STATUS_ERROR;
+						status = CON_STATUS_ERROR;
+						goto finally;
 				}
 			}
 			// Grow the body allocation if needed >>>
@@ -491,8 +470,38 @@ loop:
 		<chunk_end> crlf	:=> chunk
 		// Transfer coding chunked >>>
 
-		<*> $			{ return CON_STATUS_ERROR; }
-		<*> *			{ return CON_STATUS_ERROR; }
+		<*> $			{ status = CON_STATUS_ERROR; goto finally; }
+		<*> *			{ status = CON_STATUS_ERROR; goto finally; }
+	*/
+
+finally:
+	c->cur = s;
+	return status;
+	/* Unfolding is very expensive, find a cheaper way or drop support
+		// Unfolding <<<
+		<header,trailer> header_field_folded crlf	{
+			// Overwrite all obs_fold with equivalent number of sp chars and reparse
+#if 0
+			printf("header (folded): (%.*s) => (%.*s)\n",
+					(int)(h2 - h1), h1,
+					(int)(h4 - h3), h3);
+#endif
+
+			struct mtag*	start	= f1;
+			struct mtag*	end		= f2;
+
+			while (start && end) {
+				memset(c->tok + start->dist, ' ', end->dist - start->dist);
+				start = start->prev;
+				end = end->prev;
+			}
+
+			s = c->tok;
+			c->mar = c->tok;
+			goto loop;
+		}
+		// Unfolding >>>
+
 	*/
 }
 
@@ -510,18 +519,9 @@ void shift_msg_buffer(struct con_state* c, size_t shift) //<<<
 //>>>
 void init_msg_buffer(struct con_state* c) //<<<
 {
-	const uint64_t a1 = nanoseconds_process_cpu();
 #define BUFSIZE	8192
-#if 1
-	c->buf = obstack_alloc(c->ob, BUFSIZE);
-#else
-	c->buf = obstack_base(c->ob);
-	obstack_blank(c->ob, BUFSIZE);
-#endif
-	const uint64_t a2 = nanoseconds_process_cpu();
-	ts_log(c, "Alloc c->buf: %ld", a2-a1);
 	c->buf_size = BUFSIZE;
-	c->cur = c->mar = c->tok = c->lim = c->buf + c->buf_size;
+	c->cur = c->mar = c->tok = c->lim = c->buf = obstack_alloc(c->ob, c->buf_size);
 	c->lim[0]			= 0;	// sentinel
 	c->cond				= yycreqline;
 	/*!stags:re2c:http format = "\tc->@@ = 0;\n"; */

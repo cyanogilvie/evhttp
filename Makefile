@@ -2,8 +2,8 @@ BINS = serv fmttest
 
 CFLAGS = -I. -Ilibev-4.33 -Ilocal/include -pthread -Wall -fno-strict-aliasing -std=gnu17
 CXXFLAGS = -I. -Ilibev-4.33 -Ilocal/include -pthread -Wall -fno-strict-aliasing -std=gnu++17
-CFLAGS_DEBUG = -g -O0
-CFLAGS_OPTIMIZE = -O3 -march=native -mtune=native -flto -ffast-math
+CFLAGS_DEBUG = -ggdb3 -O0
+CFLAGS_OPTIMIZE = -ggdb3 -O3 -march=native -mtune=native -flto -ffast-math
 LDFLAGS = -lrt -lm -Llocal/lib -lfmt -lev
 
 STATIC_LIBEV = local/lib/libev.a
@@ -113,7 +113,7 @@ $(addprefix dbg_,$(addsuffix .o,$(BINS))): dbg_%.o: %.c *.h Makefile re2c
 $(BINS): %: %.o Makefile $(OBJS) deps
 	$(CC) $(CFLAGS) $(CFLAGS_OPTIMIZE) -o $@ $< $(OBJS) $(LDFLAGS)
 
-$(addprefix dbg_,$(BINS)): dbg_%: %.o Makefile $(addprefix dbg_,$(OBJS)) deps
+$(addprefix dbg_,$(BINS)): dbg_%: dbg_%.o Makefile $(addprefix dbg_,$(OBJS)) deps
 	$(CC) $(CFLAGS) $(CFLAGS_DEBUG) -o $@ $< $(addprefix dbg_,$(OBJS)) $(LDFLAGS)
 
 
@@ -124,6 +124,9 @@ $(addsuffix .dot,$(BINS)): %.dot: %.re Makefile *.h common.re local/include/*.h
 vim-gdb: dbg_serv tags
 	vim -c "set number" -c "set mouse=a" -c "set foldlevel=100" -c "Termdebug -ex set\ print\ pretty\ on --args ./dbg_serv" -c "1windo set nonumber" -c "2windo set nonumber" serv.c
 
+vim-gdb-optimized: serv tags
+	vim -c "set number" -c "set mouse=a" -c "set foldlevel=100" -c "Termdebug -ex set\ print\ pretty\ on --args ./serv" -c "1windo set nonumber" -c "2windo set nonumber" serv.c
+
 vim-gdb-re2c: local/bin/re2c
 	vim -c "set number" -c "set mouse=a" -c "set foldlevel=100" -c "Termdebug -ex set\ print\ pretty\ on --args local/bin/re2c $(REURIARGS) includetest.re -o includetest.c" -c "1windo set nonumber" -c "2windo set nonumber" deps/re2c/src/parse/scanner.cc
 
@@ -133,6 +136,6 @@ tags: $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(C
 clean:
 	-rm -rf core $(BINS) $(addprefix dbg_,$(BINS)) $(addsuffix .dot,$(BINS)) *.o tags $(RE2C_SOURCE) $(RE2C_HEADERS) build
 
-.PHONY: all clean vim-gdb
+.PHONY: all clean vim-gdb vim-gdb-optimized
 
 .SILENT: deps

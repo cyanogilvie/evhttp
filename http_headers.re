@@ -41,12 +41,37 @@ struct headers {
 };
 
 int serialize_headers(struct obstack* ob, struct headers* headers);
-void append_header(struct headers* headers, struct header* h);
+//void append_header(struct headers* headers, struct header* h);
 void remove_header(struct headers* headers, struct header* h);
-struct header* new_header(struct obstack* ob);
+//struct header* new_header(struct obstack* ob);
 struct header* last_header(struct headers* headers, enum hdr hdr);
 void init_headers(struct headers* headers);
 
+static inline void append_header(struct headers* headers, struct header* h) //<<<
+{
+	dlist_append(headers, h);
+	if (h->field_name == HDR_OTHER) {
+		const uint32_t	hash_bucket = murmurhash3(h->field_name_str, h->field_name_str_len, headers->hash_seed) % HEADERS_HASH_BUCKETS;
+
+		dlist_append(&headers->hash_buckets[hash_bucket], h);
+	} else {
+		if (headers->last[h->field_name] == NULL) {
+			headers->first[h->field_name] = h;
+			headers->last[h->field_name] = h;
+		} else {
+			headers->last[h->field_name]->type_next = h;
+			headers->last[h->field_name] = h;
+		}
+	}
+}
+
+//>>>
+static inline struct header* new_header(struct obstack* ob) //<<<
+{
+	return (struct header*)obstack_alloc(ob, sizeof(struct header));
+}
+
+//>>>
 /*!header:re2c:off */
 
 #define OB_APPEND_STATIC(ob, str) obstack_grow((ob), (str), sizeof(str)-1)
@@ -337,25 +362,6 @@ const char* header_type_name(enum hdr header) //<<<
 
 //>>>
 
-void append_header(struct headers* headers, struct header* h) //<<<
-{
-	dlist_append(headers, h);
-	if (h->field_name == HDR_OTHER) {
-		const uint32_t	hash_bucket = murmurhash3(h->field_name_str, h->field_name_str_len, headers->hash_seed) % HEADERS_HASH_BUCKETS;
-
-		dlist_append(&headers->hash_buckets[hash_bucket], h);
-	} else {
-		if (headers->last[h->field_name] == NULL) {
-			headers->first[h->field_name] = h;
-			headers->last[h->field_name] = h;
-		} else {
-			headers->last[h->field_name]->type_next = h;
-			headers->last[h->field_name] = h;
-		}
-	}
-}
-
-//>>>
 void remove_header(struct headers* headers, struct header* h) //<<<
 {
 	const enum hdr	field_name = h->field_name;
@@ -377,99 +383,6 @@ void remove_header(struct headers* headers, struct header* h) //<<<
 			}
 		}
 	}
-}
-
-//>>>
-struct header* new_header(struct obstack* ob) //<<<
-{
-	return (struct header*)obstack_alloc(ob, sizeof(struct header));
-}
-
-//>>>
-void new_header_other(struct con_state* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len) //<<<
-{
-	struct header*	hdr = new_header(c->ob);
-
-	hdr->field_name			= HDR_OTHER;
-	hdr->field_name_str		= obstack_copy0(c->ob, field_name_str, field_name_str_len);
-	hdr->field_name_str_len	= field_name_str_len;
-	hdr->field_value.str	= obstack_copy0(c->ob, field_value, field_value_len);
-
-	lowercase(hdr->field_name_str);
-
-	append_header(&c->headers, hdr);
-}
-
-//>>>
-void new_header_str(struct con_state* c, enum hdr field_name, const unsigned char* field_value, int field_value_len) //<<<
-{
-	struct header*	hdr = new_header(c->ob);
-
-	hdr->field_name			= field_name;
-	hdr->field_value.str	= obstack_copy0(c->ob, field_value, field_value_len);
-
-	append_header(&c->headers, hdr);
-}
-
-//>>>
-int push_te(struct con_state* c, enum te_types type) //<<<
-{
-	struct header*	h;
-
-	/* Reject duplicates */
-	for (h = c->headers.first[HDR_TRANSFER_ENCODING]; h; h = h->type_next)
-		if (h->field_value.integer == type) return 1;
-
-	h = new_header(c->ob);
-	h->field_name = HDR_TRANSFER_ENCODING;
-	h->field_value.integer = type;
-	append_header(&c->headers, h);
-
-	return 0;
-}
-
-//>>>
-int push_te_accept(struct con_state* c, const unsigned char* r1, const unsigned char* r2, enum te_types type) //<<<
-{
-	struct header*		h;
-	struct te_accept*	te;
-	float				rank = 0;
-
-	/* Reject duplicates */
-	for (h = c->headers.first[HDR_TE]; h; h = h->type_next) {
-		struct te_accept*	tmp_te = h->field_value.ptr;
-		if (tmp_te->type == type) return 1;
-	}
-
-	if (r1 && r2) {
-		const unsigned char* d = NULL;
-
-		for (d = r1; d<r2 && *d != '.'; d++) {
-			rank *= 10.;
-			rank += *d;
-		}
-
-		if (*d == '.') {
-			float	factor = .1;
-
-			for (d++; d<r2; d++) {
-				rank += *d * factor;
-				factor *= .1;
-			}
-		}
-
-		if (rank == 0.0) return 0;	/* Rank of 0 means "not acceptible" - ie. equivalent to not listing this type */
-	} else {
-		rank = 1.0;
-	}
-
-	h = new_header(c->ob);
-	h->field_name = HDR_TE;
-	h->field_value.ptr = te = obstack_alloc(c->ob, sizeof *te);
-	te->rank = rank;
-	append_header(&c->headers, h);
-
-	return 0;
 }
 
 //>>>

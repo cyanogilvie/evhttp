@@ -58,6 +58,7 @@ struct ev_pipe_event {
 };
 
 enum con_status {
+	CON_STATUS_UNDEF=0,
 	CON_STATUS_WAITING,
 	CON_STATUS_OVERFLOW,
 	CON_STATUS_ERROR,
@@ -153,32 +154,149 @@ enum body_storage {
 	BODY_STORAGE_OBSTACK		// Managed by c->ob obstack
 };
 
-enum aio_action {
-	AIO_DONE_CLOSE,		// Close the connection when the io completes
-	AIO_DONE_IGNORE
+enum write_complete_action {
+	WRITE_COMPLETE_CLOSE,		// Close the connection when the io completes
+	WRITE_COMPLETE_IGNORE
 };
 
-struct aio_done_action {
-	struct ev_io*		con_watch;
-	enum aio_action		action;
-	struct ev_async*	notify_w;	// If not NULL, this will get ev_async_send'ed when the io completes or fails
+enum write_source_type {
+	WRITE_SOURCE_BUF
+};
+
+struct write_source_buf {
+	const unsigned char*	buf;
+	size_t					len;
+	size_t					written;
+};
+
+//typedef void (write_job_free_cb)(struct write_job* job);
+typedef void (write_job_free_cb)(void* job);
+
+struct write_job {
+	struct dlist_elem			dl;
+	enum write_complete_action	action;
+	struct ev_loop*				notify_loop;
+	struct ev_async*			notify_w;	// If not NULL, this will get ev_async_send'ed when the io completes or fails
+	enum write_source_type		source;
+	struct obstack*				ob;
+	union {
+		struct write_source_buf	buf;	// WRITE_SOURCE_BUF
+	} src;
+	write_job_free_cb*			free_cb;
 };
 
 #include "http_headers.h"
 #include "msg.h"
 #include "report.h"
+//#include "inline.h"
 
+void lowercase(unsigned char* str);
 
 // TODO resolve these circular dependencies of struct con_state and these declarations
-void mtagpool_clear(struct mtagpool* mtp, struct con_state* c);
-void new_header_other(struct con_state* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len);
-void new_header_str(struct con_state* c, enum hdr field_name, const unsigned char* field_value, int field_value_len);
-int push_te(struct con_state* c, enum te_types type);
-int push_te_accept(struct con_state* c, const unsigned char* r1, const unsigned char* r2, enum te_types type);
+//void mtagpool_clear(struct mtagpool* mtp, struct con_state* c);
+//void new_header_other(struct con_state* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len);
+//void new_header_str(struct con_state* c, enum hdr field_name, const unsigned char* field_value, int field_value_len);
+//int push_te(struct con_state* c, enum te_types type);
+//int push_te_accept(struct con_state* c, const unsigned char* r1, const unsigned char* r2, enum te_types type);
 uint64_t con_ts(struct con_state* c);	// Number of nanoseconds since accept
 
+static inline void mtagpool_clear(struct mtagpool* mtp, struct con_state* c) //<<<
+{
+	obstack_free(mtp->ob, mtp->start);
+	mtp->start = obstack_alloc(mtp->ob, 1);
+	/*!mtags:re2c:http format = "\tc->@@{tag} = NULL;\n"; */
+}
+
+//>>>
+static inline void new_header_other(struct con_state* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len) //<<<
+{
+	struct header*	hdr = new_header(c->ob);
+
+	hdr->field_name			= HDR_OTHER;
+	hdr->field_name_str		= obstack_copy0(c->ob, field_name_str, field_name_str_len);
+	hdr->field_name_str_len	= field_name_str_len;
+	hdr->field_value.str	= obstack_copy0(c->ob, field_value, field_value_len);
+
+	lowercase(hdr->field_name_str);
+
+	append_header(&c->headers, hdr);
+}
+
+//>>>
+static inline void new_header_str(struct con_state* c, enum hdr field_name, const unsigned char* field_value, int field_value_len) //<<<
+{
+	struct header*	hdr = new_header(c->ob);
+
+	hdr->field_name			= field_name;
+	hdr->field_value.str	= obstack_copy0(c->ob, field_value, field_value_len);
+
+	append_header(&c->headers, hdr);
+}
+
+//>>>
+static inline int push_te(struct con_state* c, enum te_types type) //<<<
+{
+	struct header*	h;
+
+	/* Reject duplicates */
+	for (h = c->headers.first[HDR_TRANSFER_ENCODING]; h; h = h->type_next)
+		if (h->field_value.integer == type) return 1;
+
+	h = new_header(c->ob);
+	h->field_name = HDR_TRANSFER_ENCODING;
+	h->field_value.integer = type;
+	append_header(&c->headers, h);
+
+	return 0;
+}
+
+//>>>
+static inline int push_te_accept(struct con_state* c, const unsigned char* r1, const unsigned char* r2, enum te_types type) //<<<
+{
+	struct header*		h;
+	struct te_accept*	te;
+	float				rank = 0;
+
+	/* Reject duplicates */
+	for (h = c->headers.first[HDR_TE]; h; h = h->type_next) {
+		struct te_accept*	tmp_te = h->field_value.ptr;
+		if (tmp_te->type == type) return 1;
+	}
+
+	if (r1 && r2) {
+		const unsigned char* d = NULL;
+
+		for (d = r1; d<r2 && *d != '.'; d++) {
+			rank *= 10.;
+			rank += *d;
+		}
+
+		if (*d == '.') {
+			float	factor = .1;
+
+			for (d++; d<r2; d++) {
+				rank += *d * factor;
+				factor *= .1;
+			}
+		}
+
+		if (rank == 0.0) return 0;	/* Rank of 0 means "not acceptible" - ie. equivalent to not listing this type */
+	} else {
+		rank = 1.0;
+	}
+
+	h = new_header(c->ob);
+	h->field_name = HDR_TE;
+	h->field_value.ptr = te = obstack_alloc(c->ob, sizeof *te);
+	te->rank = rank;
+	append_header(&c->headers, h);
+
+	return 0;
+}
+
+//>>>
+
 // Utils internal API
-void lowercase(unsigned char* str);
 //uint64_t nanoseconds_process_cpu();
 extern thread_local uint64_t		t_overhead_compensation;
 #define nanoseconds_process_cpu()	(__rdtsc() - t_overhead_compensation)
@@ -249,3 +367,5 @@ void ts_puts(struct con_state* c, char*const str, int len);
 	} while(0)
 
 #endif
+
+// vim: ft=c foldmethod=marker foldmarker=<<<,>>> ts=4 shiftwidth=4

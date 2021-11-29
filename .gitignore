@@ -4,8 +4,11 @@ build
 local
 *.o
 http_headers.c
+http_headers.h
 msg.c
+msg.h
 report.c
+report.h
 serv
 fmttest
 dbg_serv

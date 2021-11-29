@@ -215,30 +215,128 @@ void ev_pipe_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 
 //>>>
 #if 0
-void respond(struct ev_io* w, int status, struct headers* headers, struct body_source* body, enum aio_action action) //<<<
+void respond(struct ev_loop* loop, struct ev_io* w, int status, struct headers* headers, struct write_source* body, enum write_complete_action action) //<<<
 {
-	struct aio_done_action*		on_complete = malloc(sizeof *on_complete);
+	struct con_state*		c = w->data;
+	struct write_job*		headers_job = obstack_alloc(c->ob, sizeof *headers_job);
+	struct write_job*		job = obstack_alloc(c->ob, sizeof *job);
 
-	on_complete->con_watch = w;
-	on_complete->aio_action = action;
-	on_complete->notify_w = NULL;
-	on_complete->aiocb = {
-		.aio_filedes	= w->fd,
-		.aio_offset		= 0,
-		.aio_buf		= NULL,	// TODO
-		.aio_nbytes		= 0,	// TODO
-		.aio_sigevent	= {
-			.sigev_notify	= SIGEV_THREAD
-		}
-	};
+	headers_job->write_complete_action = WRITE_COMPLETE_IGNORE;
+
+	job->write_complete_action = action;
+	job->notify_w = NULL;
+	job->source = *body;
+
+	dlist_append(&c->write_jobs, job);
+
+	con_io_cb(loop, w, EV_WRITE);
 }
 
 //>>>
 #endif
-void con_readable_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
+void release_write_job_obstack(void* jobPtr) //<<<
+{
+	struct write_job*	job = jobPtr;
+
+	if (job->ob) {
+		obstack_pool_release(job->ob);
+		job->ob = NULL;
+	}
+}
+
+//>>>
+void con_io_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 {
 	struct con_state*	c = w->data;
 
+	ts_puts(c, "con_io_cb", sizeof("con_io_cb")-1);
+	if (revents & EV_WRITE) { // Write any waiting data we can <<<
+		struct write_job*	job;
+		while ((job = dlist_head(&c->write_jobs))) {
+			switch (job->source) {
+				case WRITE_SOURCE_BUF: //<<<
+					{
+						struct write_source_buf*	srcbuf = &job->src.buf;
+						const ssize_t remain = srcbuf->len - srcbuf->written;
+						const uint64_t send1 = nanoseconds_process_cpu();
+						const ssize_t wrote = send(w->fd, srcbuf->buf + srcbuf->written, remain, MSG_DONTWAIT | MSG_NOSIGNAL | (job->dl.next ? MSG_MORE : 0));
+						//const ssize_t wrote = send(w->fd, srcbuf->buf + srcbuf->written, remain, MSG_DONTWAIT | MSG_NOSIGNAL);
+						const uint64_t send2 = nanoseconds_process_cpu();
+
+						if (wrote == -1) {
+							switch (errno) {
+#if EAGAIN != EWOULDBLOCK
+								case EWOULDBLOCK:
+#endif
+								case EAGAIN:
+									if (!(w->events & EV_WRITE)) {
+										ev_io_stop(loop, w);
+										const int evmask = w->events | EV_WRITE;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"
+										ev_io_modify(w, evmask);
+#pragma GCC diagnostic pop
+										ev_io_start(loop, w);
+									}
+									goto read;
+									return;
+
+								default:
+									perror("Error writing to fd");
+									goto close;
+							}
+						} else {
+							srcbuf->written += wrote;
+							ts_log(c, "Wrote %ld bytes (%ld remain): %ld cycles", wrote, srcbuf->len - srcbuf->written, send2-send1);
+							if (wrote < remain) {
+								if (!(w->events & EV_WRITE)) {
+									ev_io_stop(loop, w);
+									const int evmask = w->events | EV_WRITE;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"
+									ev_io_modify(w, evmask);
+#pragma GCC diagnostic pop
+									ev_io_start(loop, w);
+								}
+								goto read;
+							} else {
+								//ts_puts(c, "Completed write job", sizeof("Completed write job")-1);
+								// Completed this write job
+								dlist_pop_head(&c->write_jobs);
+
+								if (job->notify_loop && job->notify_w)
+									ev_async_send(job->notify_loop, job->notify_w);
+
+
+								const enum write_complete_action	action	= job->action;
+
+								if (job->free_cb)
+									job->free_cb(job);
+
+								switch (action) {
+									case WRITE_COMPLETE_IGNORE:	break;
+									case WRITE_COMPLETE_CLOSE:	goto close;
+								}
+								continue;
+							}
+						}
+					}
+					//>>>
+					break;
+
+				default:
+					ts_puts(c, "Invalid write source", sizeof("Invalid write source")-1);
+					goto close;
+					break;
+			}
+		}
+	}
+
+	// Write any waiting data we can >>>
+
+read:
+	if (!(revents & EV_READ)) return;
+	// Read any waiting data <<<
 loop:
 	{
 		const size_t		shift = c->tok - c->buf;
@@ -328,12 +426,16 @@ loop:
 				goto close;
 			}
 
+			uint64_t	shift1 = nanoseconds_process_cpu();
 			if (shift) {
 				//report("shifting to", c->tok);
 				shift_msg_buffer(c, shift);
 			}
+			uint64_t	shift2 = nanoseconds_process_cpu();
 
+			const uint64_t	read1 = nanoseconds_process_cpu();
 			const ssize_t got = read(w->fd, c->lim, c->buf_size - (c->lim - c->buf));
+			const uint64_t	read2 = nanoseconds_process_cpu();
 			if (got == -1) {
 				switch (errno) {
 #if EAGAIN != EWOULDBLOCK
@@ -341,6 +443,7 @@ loop:
 #endif
 					case EAGAIN:
 						if (c->cur < c->lim) break;	// May not have read any more, but we have some already waiting
+						ts_puts(c, "EAGAIN", sizeof("EAGAIN")-1);
 						return;
 					default:
 						perror("Error reading from con fd");
@@ -354,7 +457,7 @@ loop:
 			c->lim += got;
 			c->lim[0] = 0;	// Append sentinel
 
-			ts_log(c, "read: %ld bytes", got);
+			ts_log(c, "read: %ld bytes, %ld cycles, shift: %ld", got, read2-read1, shift2-shift1);
 			const unsigned char*	bbefore = c->cur;
 			uint64_t parse1 = nanoseconds_process_cpu();
 			c->status = parse_http_message(c);
@@ -514,6 +617,8 @@ loop:
 		//>>>
 	}
 
+	// Read any waiting data >>>
+
 	return;
 
 close:
@@ -533,7 +638,14 @@ close:
 		c->body_storage = BODY_STORAGE_NONE;
 	}
 	mtagpool_free(&c->mtp);
-	//c->headers = {0};
+	{ // Cancel any uncompleted write jobs
+		struct write_job*	job;
+		while ((job = dlist_pop_head(&c->write_jobs))) {
+			// TODO: notify the failure (cancellation) of this write job somehow?
+			if (job->free_cb)
+				job->free_cb(job);
+		}
+	}
 	ts_log_output(c);
 	obstack_pool_release(c->logs);
 	obstack_pool_release(c->ob);
@@ -543,8 +655,80 @@ close:
 	return;
 
 close_400:
-	// TODO: Respond with 400 Bad Request and close
-	goto close;
+	// Respond with 400 Bad Request and close
+	ts_puts(c, "Responding with 400 Bad Request", sizeof("Responding with 400 Bad Request")-1);
+	{
+		struct obstack*	ob = obstack_pool_get(OBSTACK_POOL_SMALL);
+		struct headers	rheaders;
+
+		// Assemble body
+		obstack_grow(ob, "Bad Request", sizeof("Bad Request")-1);
+		const size_t			body_len = obstack_object_size(ob);
+		const unsigned char*	body = obstack_finish(ob);
+
+		init_headers(&rheaders);
+#define ADD_STATIC_HEADER(hdrname, strval) \
+		do { \
+			struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
+			h->field_name = HDR_OTHER; \
+			h->field_name_str = (unsigned char*)hdrname; \
+			h->field_name_str_len = sizeof(hdrname)-1; \
+			h->field_value.str = (unsigned char*)strval; \
+			append_header(&rheaders, h); \
+		} while(0);
+
+		ADD_STATIC_HEADER("Server",			"evhttp 0.1");
+		// TODO: Date, etc
+		ADD_STATIC_HEADER("Connection",		"close");
+		ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
+
+#define HDRNAME	"Content-Length"
+		struct header*	h = obstack_alloc(ob, sizeof(struct header));
+		h->field_name = HDR_CONTENT_LENGTH;
+		h->field_value.integer = body_len;
+		append_header(&rheaders, h);
+
+		obstack_grow(ob, "HTTP/1.1 400 Bad Request\r\n", sizeof("HTTP/1.1 400 Bad Request\r\n")-1);
+		if (serialize_headers(ob, &rheaders)) {
+			ts_puts(c, "Error serializing headers", sizeof("Error serializing headers"));
+			goto close;
+		}
+
+		const size_t			hdrbuf_len = obstack_object_size(ob);
+		const unsigned char*	hdrbuf = obstack_finish(ob);
+		struct write_job*		write_headers = obstack_alloc(ob, sizeof *write_headers);
+		memset(write_headers, 0, sizeof *write_headers);
+		write_headers->source = WRITE_SOURCE_BUF;
+		write_headers->src.buf.len = hdrbuf_len;
+		write_headers->src.buf.buf = hdrbuf;
+		write_headers->action = WRITE_COMPLETE_IGNORE;
+		dlist_append(&c->write_jobs, write_headers);
+		
+
+		struct write_job*		write_body = obstack_alloc(ob, sizeof *write_body);
+		memset(write_body, 0, sizeof *write_body);
+		write_body->source = WRITE_SOURCE_BUF;
+		write_body->src.buf.len = body_len;
+		write_body->src.buf.buf = body;
+		write_body->action = WRITE_COMPLETE_CLOSE;
+		write_body->ob = ob;
+		write_body->free_cb = &release_write_job_obstack;
+		dlist_append(&c->write_jobs, write_body);
+
+		if (w->events & EV_READ) {
+			ev_io_stop(loop, w);
+			//const int evmask = (w->events & ~EV_READ) | EV_WRITE;
+			const int evmask = w->events & ~EV_READ;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"
+			ev_io_modify(w, evmask);
+#pragma GCC diagnostic pop
+			ev_io_start(loop, w);
+		}
+
+		ts_puts(c, "Constucted and queued response", sizeof("Constucted and queued response")-1);
+		con_io_cb(loop, w, EV_WRITE);
+	}
 	return;
 
 close_500:
@@ -559,7 +743,10 @@ message_complete:
 		ev_io_stop(loop, w);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wparentheses"
-		ev_io_modify(w, 0);		// Disable callbacks for this fd while the message is processed
+		const int evmask = w->events & ~EV_READ;
+		ev_io_modify(w, evmask);		// Disable readable callbacks for this fd while the message is processed
+		if (evmask & EV_WRITE)
+			ev_io_start(loop, w);
 #pragma GCC diagnostic pop
 	}
 	ts_puts(c, "Message complete", sizeof("Message complete"));
@@ -573,10 +760,10 @@ message_complete:
 		const int				hstr_len = obstack_object_size(ob);
 		const unsigned char*	hstr = obstack_finish(ob);
 		ts_log(c, "Headers: %ld cycles\n%.*s", ser2-ser1, hstr_len, hstr);
+		//report("headers", hstr);
 	}
 	obstack_pool_release(ob); ob = NULL;
-	goto close;
-	return;
+	goto close_400;	// DEBUG
 }
 
 //>>>
@@ -626,15 +813,12 @@ void accept_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 	c->logs_tail		= NULL;
 	c->last_log			= accept_start;
 	ts_log(c, "accept: %ld, obstack_pool_get: %ld, obstack_alloc: %ld", a3-a1, tb-ta, tc-tb);
-	ts_puts(c, "Init buf start", sizeof("Init buf start"));
 	init_msg_buffer(c);
-	ts_puts(c, "Init buf", sizeof("Init buf"));
 	c->accept_time		= accept_start;
 	/*
 	ts_log(c, "%s", "Allocated con_state");
 	ts_log(c, "%s", "nop");
 	*/
-	ts_puts(c, "Allocated con_state", sizeof("Allocated con_state"));
 	c->state			= -1;
 	c->status			= CON_STATUS_WAITING;
 	c->status_code[0]	= 0;
@@ -654,11 +838,13 @@ void accept_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 	init_headers(&c->headers);
 
 	con_watch = malloc(sizeof *con_watch);
-	//ev_io_init(con_watch, con_readable_cb, con_fd, EV_READ);
-	ev_init(con_watch, con_readable_cb);
+	//ev_io_init(con_watch, con_io_cb, con_fd, EV_READ);
+	ev_init(con_watch, con_io_cb);
 	ev_io_set(con_watch, con_fd, EV_READ);
 	con_watch->data = c;
 	ev_io_start(io_thread_loop, con_watch);
+	ts_puts(c, "accepted, registered with libev", sizeof("accepted, registered with libev")-1);
+	con_io_cb(io_thread_loop, con_watch, EV_READ);	// Optimistically assume there is already data for us, rather than waiting for the readable event
 }
 
 //>>>

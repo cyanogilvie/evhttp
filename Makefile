@@ -130,8 +130,8 @@ vim-gdb-optimized: serv tags
 vim-gdb-re2c: local/bin/re2c
 	vim -c "set number" -c "set mouse=a" -c "set foldlevel=100" -c "Termdebug -ex set\ print\ pretty\ on --args local/bin/re2c $(REURIARGS) includetest.re -o includetest.c" -c "1windo set nonumber" -c "2windo set nonumber" deps/re2c/src/parse/scanner.cc
 
-tags: $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(CXX_OBJS)) common.re *.h local/include/*.h
-	ctags-exuberant --recurse=yes --langmap=c:+.re $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(CXX_OBJS)) *.h local/include/*.h
+tags: $(addsuffix .c,$(BINS)) $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(CXX_OBJS)) common.re *.h local/include/*.h Makefile
+	ctags-exuberant --recurse=yes --langmap=c:+.re $(addsuffix .c,$(BINS)) $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(CXX_OBJS)) *.h common.re local/include/*.h
 
 clean:
 	-rm -rf core $(BINS) $(addprefix dbg_,$(BINS)) $(addsuffix .dot,$(BINS)) *.o tags $(RE2C_SOURCE) $(RE2C_HEADERS) build

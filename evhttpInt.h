@@ -41,11 +41,26 @@ struct listensock_queue {
 };
 
 struct listensock {
-	int					ev_pipe_w;
-	struct ev_io		accept_watcher;
+	struct ev_io		accept_watcher;		// Must be first
+	struct ev_loop*		requests_loop;
+	struct ev_async		requests_ready;		// triggered when new requests are added
+	pthread_mutex_t		requests_mutex;
+	struct dlist		requests;			// dlist of struct con_state that have requests ready.  Access must use requests_mutex
 	struct listensock*	next;
 };
 
+enum con_role {
+	CON_ROLE_SERVER,
+	CON_ROLE_CLIENT
+};
+
+struct con_watch {
+	struct ev_io		w;					// Must be first
+	enum con_role		role;
+	struct listensock*	listener;
+};
+
+/*
 enum ev_type {
 	EV_PIPE_NEWCON,
 	EV_PIPE_REQ,
@@ -56,6 +71,7 @@ struct ev_pipe_event {
 	enum ev_type	type;
 	void*			data;
 };
+*/
 
 enum con_status {
 	CON_STATUS_UNDEF=0,
@@ -64,11 +80,6 @@ enum con_status {
 	CON_STATUS_ERROR,
 	CON_STATUS_BODY,
 	CON_STATUS_BODY_DONE
-};
-
-enum con_role {
-	CON_ROLE_SERVER,
-	CON_ROLE_CLIENT
 };
 
 enum ev_methods {

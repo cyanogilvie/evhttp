@@ -4,6 +4,8 @@
 
 /*!header:re2c:on */
 struct con_state {
+	struct dlist_elem	dl;				// Must be first
+
 	enum con_role		role;
 
 	uint64_t			accept_time;	// The first moment we became aware of the connection (nanoseconds resolution, cputime since process start)
@@ -11,12 +13,14 @@ struct con_state {
 	// Valid for requests
 	enum ev_methods		method;
 	unsigned char*		custom_method;
+	unsigned char*		target;
 	struct cookie*		cookies;
 
 	// Valid for responses
 	unsigned char		status_code[4];
 	int					status_numeric;
 	struct set_cookie*	set_cookies;
+	struct headers		out_headers;
 
 	// Valid for both requests and responses
 	int					connectionflags;

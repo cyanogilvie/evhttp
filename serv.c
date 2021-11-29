@@ -16,6 +16,7 @@ static struct ev_loop*		io_thread_loop = NULL;
 static struct ev_async		io_thread_wakeup;
 
 pthread_mutex_t		listensock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 struct listensock_queue g_listensock_queue = {
 	.head = NULL,
 	.tail = NULL
@@ -80,11 +81,7 @@ void close_t_cpu_cycles_fd(void* cdata) //<<<
 //>>>
 static void* thread_start(void* cdata) //<<<
 {
-	struct timespec after;
-	double delta;
 	struct perf_event_attr	pe = {0};
-
-	clock_gettime(CLOCK_MONOTONIC, &after);
 
 	io_thread_loop = ev_loop_new(EVFLAG_AUTO);
 	if (io_thread_loop == NULL) {
@@ -160,8 +157,10 @@ static void* thread_start(void* cdata) //<<<
 	const uint64_t	empty4 = nanoseconds_process_cpu();
 	printf("nanoseconds_process_cpu overhead compensated: %ld\n", empty4 - empty3);
 
+	/*
 	delta = after.tv_sec - before.tv_sec + (after.tv_nsec - before.tv_nsec)/1e9 - empty;
 	fprintf(stderr, "io_thread start latency: %.1f microseconds\n", delta*1e6);
+	*/
 
 	printf("In thread %ld\n", pthread_self());
 
@@ -173,6 +172,7 @@ static void* thread_start(void* cdata) //<<<
 }
 
 //>>>
+#if 0
 void ev_pipe_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 {
 	struct ev_pipe_event	pipe_ev;
@@ -214,6 +214,7 @@ void ev_pipe_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 }
 
 //>>>
+#endif
 #if 0
 void respond(struct ev_loop* loop, struct ev_io* w, int status, struct headers* headers, struct write_source* body, enum write_complete_action action) //<<<
 {
@@ -245,9 +246,97 @@ void release_write_job_obstack(void* jobPtr) //<<<
 }
 
 //>>>
-void con_io_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
+void modify_io_evmask(struct ev_loop* loop, struct ev_io* w, int set, int clear) //<<<
 {
-	struct con_state*	c = w->data;
+	const int evmask	= (w->events | set) & ~clear;
+
+	ev_io_stop(loop, w);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"
+	ev_io_modify(w, evmask);
+#pragma GCC diagnostic pop
+	if (evmask & (EV_READ|EV_WRITE)) {
+		ev_io_start(loop, w);
+	}
+}
+
+//>>>
+struct con_state* init_con_state(enum con_role role) //<<<
+{
+	uint64_t			now = nanoseconds_process_cpu();
+	struct obstack*		ob = obstack_pool_get(OBSTACK_POOL_SMALL);
+	struct con_state*	c = obstack_alloc(ob, sizeof *c);
+
+	c->ob				= ob;
+	c->logs				= obstack_pool_get(OBSTACK_POOL_SMALL);
+	c->logs_head		= NULL;
+	c->logs_tail		= NULL;
+	c->last_log			= now;
+	init_msg_buffer(c);
+	c->accept_time		= now;
+	c->state			= -1;
+	c->status			= CON_STATUS_WAITING;
+	c->status_code[0]	= 0;
+	c->role				= role;
+	c->method			= METHOD_UNSPECIFIED;
+	c->custom_method	= NULL;
+	c->http_ver			= NULL;
+	c->connectionflags	= 0;
+	c->body_len			= BODY_LEN_NOTSET;
+	c->body_size		= 0;
+	c->body_avail		= 0;
+	c->body				= NULL;
+	c->body_storage		= BODY_STORAGE_NONE;
+	c->body_fd			= -1;
+	c->chunk_remain		= 0;
+
+	init_headers(&c->headers);
+	init_headers(&c->out_headers);
+
+	return c;
+}
+
+//>>>
+void free_con_state(struct con_watch* w) //<<<
+{
+	struct con_state*	c = w->w.data;
+
+	if (c->body_fd != -1) {
+		close(c->body_fd);
+		c->body_fd = -1;
+	}
+	if (c->body_storage == BODY_STORAGE_MMAP) {
+		if (c->body != MAP_FAILED) {
+			if (munmap(c->body, c->body_avail)) {
+				perror("Error munmapping body tmpfile");
+			}
+			c->body = NULL;
+		}
+		c->body_storage = BODY_STORAGE_NONE;
+	}
+	mtagpool_free(&c->mtp);
+	{ // Cancel any uncompleted write jobs
+		struct write_job*	job;
+		while ((job = dlist_pop_head(&c->write_jobs))) {
+			// TODO: notify the failure (cancellation) of this write job somehow?
+			if (job->free_cb)
+				job->free_cb(job);
+		}
+	}
+	ts_log_output(c);
+	obstack_pool_release(c->logs);
+	obstack_pool_release(c->ob);
+	w->w.data = NULL;
+}
+
+//>>>
+void con_io_cb(struct ev_loop* loop, struct ev_io* _w, int revents) //<<<
+{
+	struct con_watch*	w = (struct con_watch*)_w;
+	struct con_state*	c = w->w.data;
+
+	if (c == NULL)
+		c = init_con_state(w->role);
 
 	ts_puts(c, "con_io_cb", sizeof("con_io_cb")-1);
 	if (revents & EV_WRITE) { // Write any waiting data we can <<<
@@ -259,8 +348,8 @@ void con_io_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 						struct write_source_buf*	srcbuf = &job->src.buf;
 						const ssize_t remain = srcbuf->len - srcbuf->written;
 						const uint64_t send1 = nanoseconds_process_cpu();
-						const ssize_t wrote = send(w->fd, srcbuf->buf + srcbuf->written, remain, MSG_DONTWAIT | MSG_NOSIGNAL | (job->dl.next ? MSG_MORE : 0));
-						//const ssize_t wrote = send(w->fd, srcbuf->buf + srcbuf->written, remain, MSG_DONTWAIT | MSG_NOSIGNAL);
+						const ssize_t wrote = send(w->w.fd, srcbuf->buf + srcbuf->written, remain, MSG_DONTWAIT | MSG_NOSIGNAL | (job->dl.next ? MSG_MORE : 0));
+						//const ssize_t wrote = send(w->w.fd, srcbuf->buf + srcbuf->written, remain, MSG_DONTWAIT | MSG_NOSIGNAL);
 						const uint64_t send2 = nanoseconds_process_cpu();
 
 						if (wrote == -1) {
@@ -269,15 +358,8 @@ void con_io_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 								case EWOULDBLOCK:
 #endif
 								case EAGAIN:
-									if (!(w->events & EV_WRITE)) {
-										ev_io_stop(loop, w);
-										const int evmask = w->events | EV_WRITE;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wparentheses"
-										ev_io_modify(w, evmask);
-#pragma GCC diagnostic pop
-										ev_io_start(loop, w);
-									}
+									if (!(w->w.events & EV_WRITE))
+										modify_io_evmask(loop, (struct ev_io*)w, EV_WRITE, 0);
 									goto read;
 									return;
 
@@ -289,15 +371,8 @@ void con_io_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 							srcbuf->written += wrote;
 							ts_log(c, "Wrote %ld bytes (%ld remain): %ld cycles", wrote, srcbuf->len - srcbuf->written, send2-send1);
 							if (wrote < remain) {
-								if (!(w->events & EV_WRITE)) {
-									ev_io_stop(loop, w);
-									const int evmask = w->events | EV_WRITE;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wparentheses"
-									ev_io_modify(w, evmask);
-#pragma GCC diagnostic pop
-									ev_io_start(loop, w);
-								}
+								if (!(w->w.events & EV_WRITE))
+									modify_io_evmask(loop, (struct ev_io*)w, EV_WRITE, 0);
 								goto read;
 							} else {
 								//ts_puts(c, "Completed write job", sizeof("Completed write job")-1);
@@ -395,7 +470,7 @@ loop:
 
 			// Grow the body allocation if needed >>>
 			// Read more body bytes <<<
-			got = read(w->fd, c->body + c->body_size, remain);
+			got = read(w->w.fd, c->body + c->body_size, remain);
 			if (got == -1) {
 				switch (errno) {
 #if EAGAIN != EWOULDBLOCK
@@ -434,7 +509,7 @@ loop:
 			uint64_t	shift2 = nanoseconds_process_cpu();
 
 			const uint64_t	read1 = nanoseconds_process_cpu();
-			const ssize_t got = read(w->fd, c->lim, c->buf_size - (c->lim - c->buf));
+			const ssize_t got = read(w->w.fd, c->lim, c->buf_size - (c->lim - c->buf));
 			const uint64_t	read2 = nanoseconds_process_cpu();
 			if (got == -1) {
 				switch (errno) {
@@ -622,34 +697,10 @@ loop:
 	return;
 
 close:
-	close(w->fd);
-	ev_io_stop(loop, w);
-	if (c->body_fd != -1) {
-		close(c->body_fd);
-		c->body_fd = -1;
-	}
-	if (c->body_storage == BODY_STORAGE_MMAP) {
-		if (c->body != MAP_FAILED) {
-			if (munmap(c->body, c->body_avail)) {
-				perror("Error munmapping body tmpfile");
-			}
-			c->body = NULL;
-		}
-		c->body_storage = BODY_STORAGE_NONE;
-	}
-	mtagpool_free(&c->mtp);
-	{ // Cancel any uncompleted write jobs
-		struct write_job*	job;
-		while ((job = dlist_pop_head(&c->write_jobs))) {
-			// TODO: notify the failure (cancellation) of this write job somehow?
-			if (job->free_cb)
-				job->free_cb(job);
-		}
-	}
-	ts_log_output(c);
-	obstack_pool_release(c->logs);
-	obstack_pool_release(c->ob);
-	w->data = NULL;
+	close(w->w.fd);
+	ev_io_stop(loop, (struct ev_io*)w);
+	free_con_state(w);
+	c = NULL;
 	free(w);
 	w = NULL;
 	return;
@@ -659,14 +710,13 @@ close_400:
 	ts_puts(c, "Responding with 400 Bad Request", sizeof("Responding with 400 Bad Request")-1);
 	{
 		struct obstack*	ob = obstack_pool_get(OBSTACK_POOL_SMALL);
-		struct headers	rheaders;
 
 		// Assemble body
 		obstack_grow(ob, "Bad Request", sizeof("Bad Request")-1);
 		const size_t			body_len = obstack_object_size(ob);
 		const unsigned char*	body = obstack_finish(ob);
 
-		init_headers(&rheaders);
+		init_headers(&c->out_headers);
 #define ADD_STATIC_HEADER(hdrname, strval) \
 		do { \
 			struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
@@ -674,7 +724,7 @@ close_400:
 			h->field_name_str = (unsigned char*)hdrname; \
 			h->field_name_str_len = sizeof(hdrname)-1; \
 			h->field_value.str = (unsigned char*)strval; \
-			append_header(&rheaders, h); \
+			append_header(&c->out_headers, h); \
 		} while(0);
 
 		ADD_STATIC_HEADER("Server",			"evhttp 0.1");
@@ -682,14 +732,13 @@ close_400:
 		ADD_STATIC_HEADER("Connection",		"close");
 		ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
 
-#define HDRNAME	"Content-Length"
 		struct header*	h = obstack_alloc(ob, sizeof(struct header));
 		h->field_name = HDR_CONTENT_LENGTH;
 		h->field_value.integer = body_len;
-		append_header(&rheaders, h);
+		append_header(&c->out_headers, h);
 
 		obstack_grow(ob, "HTTP/1.1 400 Bad Request\r\n", sizeof("HTTP/1.1 400 Bad Request\r\n")-1);
-		if (serialize_headers(ob, &rheaders)) {
+		if (serialize_headers(ob, &c->out_headers)) {
 			ts_puts(c, "Error serializing headers", sizeof("Error serializing headers"));
 			goto close;
 		}
@@ -715,19 +764,11 @@ close_400:
 		write_body->free_cb = &release_write_job_obstack;
 		dlist_append(&c->write_jobs, write_body);
 
-		if (w->events & EV_READ) {
-			ev_io_stop(loop, w);
-			//const int evmask = (w->events & ~EV_READ) | EV_WRITE;
-			const int evmask = w->events & ~EV_READ;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wparentheses"
-			ev_io_modify(w, evmask);
-#pragma GCC diagnostic pop
-			ev_io_start(loop, w);
-		}
+		if (w->w.events & EV_READ)
+			modify_io_evmask(loop, (struct ev_io*)w, 0, EV_READ);
 
 		ts_puts(c, "Constucted and queued response", sizeof("Constucted and queued response")-1);
-		con_io_cb(loop, w, EV_WRITE);
+		con_io_cb(loop, (struct ev_io*)w, EV_WRITE);
 	}
 	return;
 
@@ -739,16 +780,9 @@ close_500:
 	
 
 message_complete:
-	if (w) {
-		ev_io_stop(loop, w);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wparentheses"
-		const int evmask = w->events & ~EV_READ;
-		ev_io_modify(w, evmask);		// Disable readable callbacks for this fd while the message is processed
-		if (evmask & EV_WRITE)
-			ev_io_start(loop, w);
-#pragma GCC diagnostic pop
-	}
+	if (w)
+		modify_io_evmask(loop, (struct ev_io*)w, 0, EV_READ|EV_WRITE);
+	/*
 	ts_puts(c, "Message complete", sizeof("Message complete"));
 	// TODO: dispatch callback for message
 	struct obstack* ob = obstack_pool_get(OBSTACK_POOL_SMALL);
@@ -763,88 +797,60 @@ message_complete:
 		//report("headers", hstr);
 	}
 	obstack_pool_release(ob); ob = NULL;
-	goto close_400;	// DEBUG
+	*/
+	pthread_mutex_lock(&w->listener->requests_mutex);
+	dlist_append(&w->listener->requests, c);
+	pthread_mutex_unlock(&w->listener->requests_mutex);
+
+	ev_async_send(w->listener->requests_loop, &w->listener->requests_ready);
+	return;
 }
 
 //>>>
-void accept_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
+void accept_cb(struct ev_loop* loop, struct ev_io* _w, int revents) //<<<
 {
-	uint64_t					accept_start = nanoseconds_process_cpu();
+	//uint64_t					accept_start = nanoseconds_process_cpu();
+	struct listensock*			w = (struct listensock*)_w;
 	int							con_fd;
 	struct sockaddr_storage		con_addr;
-	struct ev_io*				con_watch = NULL;
-	struct con_state*			c;
+	struct con_watch*			con_watch = NULL;
 	socklen_t					addrlen = sizeof con_addr;
-	struct obstack*				ob;
-	
-	uint64_t	a1 = nanoseconds_process_cpu();
-#if 0
-	con_fd = accept(w->fd, (struct sockaddr*)&con_addr, &addrlen);
+
+	con_fd = accept4(w->accept_watcher.fd, (struct sockaddr*)&con_addr, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 	if (con_fd == -1) {
 		perror("Could not accept new connection");
 		exit(EXIT_FAILURE);
 	}
-	uint64_t	a2 = nanoseconds_process_cpu();
-
-	if (
-			-1 == fcntl(con_fd, F_SETFD, FD_CLOEXEC) ||
-			-1 == fcntl(con_fd, F_SETFL, O_NONBLOCK)
-	) {
-		perror("Could not set FD_CLOEXEC and O_NONBLOCK on con_fd");
-		exit(EXIT_FAILURE);
-	}
-#else
-	con_fd = accept4(w->fd, (struct sockaddr*)&con_addr, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
-	if (con_fd == -1) {
-		perror("Could not accept new connection");
-		exit(EXIT_FAILURE);
-	}
-#endif
-	uint64_t	a3 = nanoseconds_process_cpu();
-
-	uint64_t	ta = nanoseconds_process_cpu();
-	ob = obstack_pool_get(OBSTACK_POOL_SMALL);
-	uint64_t	tb = nanoseconds_process_cpu();
-	c = obstack_alloc(ob, sizeof *c);
-	uint64_t	tc = nanoseconds_process_cpu();
-	c->ob				= ob;
-	c->logs				= obstack_pool_get(OBSTACK_POOL_SMALL);
-	c->logs_head		= NULL;
-	c->logs_tail		= NULL;
-	c->last_log			= accept_start;
-	ts_log(c, "accept: %ld, obstack_pool_get: %ld, obstack_alloc: %ld", a3-a1, tb-ta, tc-tb);
-	init_msg_buffer(c);
-	c->accept_time		= accept_start;
-	/*
-	ts_log(c, "%s", "Allocated con_state");
-	ts_log(c, "%s", "nop");
-	*/
-	c->state			= -1;
-	c->status			= CON_STATUS_WAITING;
-	c->status_code[0]	= 0;
-	c->role				= CON_ROLE_SERVER;
-	c->method			= METHOD_UNSPECIFIED;
-	c->custom_method	= NULL;
-	c->http_ver			= NULL;
-	c->connectionflags	= 0;
-	c->body_len			= BODY_LEN_NOTSET;
-	c->body_size		= 0;
-	c->body_avail		= 0;
-	c->body				= NULL;
-	c->body_storage		= BODY_STORAGE_NONE;
-	c->body_fd			= -1;
-	c->chunk_remain		= 0;
-
-	init_headers(&c->headers);
 
 	con_watch = malloc(sizeof *con_watch);
-	//ev_io_init(con_watch, con_io_cb, con_fd, EV_READ);
-	ev_init(con_watch, con_io_cb);
-	ev_io_set(con_watch, con_fd, EV_READ);
-	con_watch->data = c;
-	ev_io_start(io_thread_loop, con_watch);
-	ts_puts(c, "accepted, registered with libev", sizeof("accepted, registered with libev")-1);
-	con_io_cb(io_thread_loop, con_watch, EV_READ);	// Optimistically assume there is already data for us, rather than waiting for the readable event
+	con_watch->listener = w;
+	con_watch->role = CON_ROLE_SERVER;
+	//ev_io_init((struct ev_io*)con_watch, con_io_cb, con_fd, EV_READ);
+	ev_init((struct ev_io*)con_watch, con_io_cb);
+	ev_io_set((struct ev_io*)con_watch, con_fd, EV_READ);
+	con_watch->w.data = NULL;
+	ev_io_start(loop, (struct ev_io*)con_watch);
+	con_io_cb(loop, (struct ev_io*)con_watch, EV_READ);	// Optimistically assume there is already data for us, rather than waiting for the readable event
+}
+
+//>>>
+void requests_ready_cb(struct ev_loop* loop, struct ev_async* w, int revents) //<<<
+{
+	struct listensock*		listensock = w->data;
+
+	printf("Main thread requests_ready_cb\n");
+
+	pthread_mutex_lock(&listensock->requests_mutex);
+	struct dlist	requests = listensock->requests;
+	listensock->requests.head = NULL;
+	listensock->requests.tail = NULL;
+	pthread_mutex_unlock(&listensock->requests_mutex);
+
+	struct con_state*	c;
+	while ((c = dlist_pop_head(&requests))) {
+		ts_log(c, "Got request in main thread: %ld --------------------------", pthread_self());
+		ts_log_output(c);
+	}
 }
 
 //>>>
@@ -858,10 +864,10 @@ void start_listen(const char* node, const char* service) //<<<
 	int					rc;
 
 	memset(&hints, 0, sizeof hints);
-	hints.ai_family		= AF_INET;
+	//hints.ai_family		= AF_INET;
 	hints.ai_socktype	= SOCK_STREAM;
 	hints.ai_protocol	= 0;
-	if ((rc = getaddrinfo(NULL, "1080", &hints, &res))) {
+	if ((rc = getaddrinfo(node, service, &hints, &res))) {
 		if (rc == EAI_SYSTEM) {
 			perror("Could not resolve listen address");
 		} else {
@@ -918,12 +924,15 @@ void start_listen(const char* node, const char* service) //<<<
 		}
 
 		accept_watch = malloc(sizeof *accept_watch);
-		ev_io_init(&accept_watch->accept_watcher, accept_cb, listen_fd_http, EV_READ);
-		accept_watch->ev_pipe_w = ev_pipe[1];
+		memset(accept_watch, 0, sizeof *accept_watch);
+		pthread_mutex_init(&accept_watch->requests_mutex, NULL);
+		accept_watch->requests_loop = main_loop;
+		accept_watch->requests_ready.data = accept_watch;
+		ev_async_init(&accept_watch->requests_ready, requests_ready_cb);
+		ev_io_init((struct ev_io*)accept_watch, accept_cb, listen_fd_http, EV_READ);
 		post_listensock(accept_watch);
 
-		ev_io_init(mainthread_ev_pipe_watch, ev_pipe_cb, ev_pipe[0], EV_READ);
-		ev_io_start(main_loop, mainthread_ev_pipe_watch);
+		ev_async_start(main_loop, &accept_watch->requests_ready);
 	}
 	freeaddrinfo(res);
 }
@@ -953,24 +962,13 @@ int main(int argc, char** argv) //<<<
 
 	PTHREAD_OK(pthread_attr_init(&attr), "pthread_attr_init failed");
 	PTHREAD_OK(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED), "pthread_attr_setdetachstate failed");
-	struct timespec first;
-	struct timespec after;
-	double delta;
-	clock_gettime(CLOCK_MONOTONIC, &first);	/* Warm up the call */
-	clock_gettime(CLOCK_MONOTONIC, &first);
-	clock_gettime(CLOCK_MONOTONIC, &before);
-	empty = before.tv_sec - first.tv_sec + (before.tv_nsec - first.tv_nsec)/1e9;
-	clock_gettime(CLOCK_MONOTONIC, &before);
 	PTHREAD_OK(pthread_create(&tid, &attr, thread_start, NULL), "pthread_create failed");
-	clock_gettime(CLOCK_MONOTONIC, &after);
-	delta = after.tv_sec - before.tv_sec + (after.tv_nsec - before.tv_nsec)/1e9 - empty;
-	fprintf(stderr, "Main thread pthread_create time: %.1f microseconds\n", delta*1e6);
 	PTHREAD_OK(pthread_attr_destroy(&attr), "pthread_attr_destroy failed");
-	printf("In main thread, created thread %ld\n", tid);
 
 	// TODO: properly wait for our io_thread to be ready to receive the async wakeup
 	usleep(10000);
-	start_listen(NULL, "1080");
+	start_listen("0.0.0.0", "1080");
+	start_listen("::1", "1080");
 
 	ev_run(main_loop, 0);
 

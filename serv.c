@@ -11,9 +11,22 @@ static void my_obstack_alloc_failed()
 struct timespec before;
 double empty = 0.0;
 
+static int					main_loop_epoll_fd = -1;
 static struct ev_loop*		main_loop = NULL;
 static struct ev_loop*		io_thread_loop = NULL;
 static struct ev_async		io_thread_wakeup;
+
+typedef void (msg_handler)(struct con_watch* w);
+
+struct msg_queue {
+	struct dlist_elem		dl;		// Must be first
+	int						evfd;
+	pthread_mutex_t			msgs_mutex;
+	struct dlist			msgs;
+	msg_handler*			cb;
+};
+pthread_rwlock_t	msg_queues_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+struct dlist		msg_queues = {0};
 
 pthread_mutex_t		listensock_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -27,10 +40,18 @@ struct listensock_queue g_listensock_active = {
 	.tail = NULL
 };
 
+pthread_mutex_t		write_message_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct dlist g_write_message_queue = {
+	.head = NULL,
+	.tail = NULL
+};
+
 //thread_local struct perf_event_attr	t_pe = {0};
 thread_local int		t_cpu_cycles_fd;
 thread_local uint64_t	t_overhead = 0;
 thread_local uint64_t	t_overhead_compensation = 0;
+
+void con_io_cb(struct ev_loop* loop, struct ev_io* _w, int revents);
 
 void post_listensock(struct listensock* sock) //<<<
 {
@@ -48,25 +69,59 @@ void post_listensock(struct listensock* sock) //<<<
 }
 
 //>>>
+void modify_io_evmask(struct ev_loop* loop, struct ev_io* w, int set, int clear) //<<<
+{
+	const int evmask	= (w->events | set) & ~clear;
+
+	ev_io_stop(loop, w);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wparentheses"
+	ev_io_modify(w, evmask);
+#pragma GCC diagnostic pop
+	if (evmask & (EV_READ|EV_WRITE)) {
+		ev_io_start(loop, w);
+	}
+}
+
+//>>>
 static void io_thread_wakeup_cb(struct ev_loop* loop, struct ev_async* w, int revents) //<<<
 {
 	struct listensock*	sock = NULL;
 
-	pthread_mutex_lock(&listensock_mutex);
-	sock = g_listensock_queue.head;
-	while (sock) {
-		ev_io_start(io_thread_loop, &sock->accept_watcher);
-		sock = sock->next;
+	// Receive and start listen sock accept watches <<<
+	if (g_listensock_queue.head) {
+		pthread_mutex_lock(&listensock_mutex);
+		sock = g_listensock_queue.head;
+		while (sock) {
+			ev_io_start(io_thread_loop, &sock->accept_watcher);
+			sock = sock->next;
+		}
+		if (g_listensock_active.tail) {
+			g_listensock_active.tail->next = g_listensock_queue.head;
+			g_listensock_active.tail = g_listensock_queue.tail;
+		} else {
+			g_listensock_active.head = g_listensock_queue.head;
+			g_listensock_active.tail = g_listensock_queue.tail;
+		}
+		g_listensock_queue.head = g_listensock_queue.tail = NULL;
+		pthread_mutex_unlock(&listensock_mutex);
 	}
-	if (g_listensock_active.tail) {
-		g_listensock_active.tail->next = g_listensock_queue.head;
-		g_listensock_active.tail = g_listensock_queue.tail;
-	} else {
-		g_listensock_active.head = g_listensock_queue.head;
-		g_listensock_active.tail = g_listensock_queue.tail;
+	// Receive and start listen sock accept watches >>>
+
+	// Receive and start queued write jobs <<<
+	if (g_write_message_queue.head) {
+		pthread_mutex_lock(&write_message_queue_mutex);
+		struct dlist	write_queue = g_write_message_queue;
+		g_write_message_queue.head = g_write_message_queue.tail = NULL;
+		pthread_mutex_unlock(&write_message_queue_mutex);
+
+		struct con_watch*	w;
+		while ((w = dlist_pop_head(&write_queue))) {
+			modify_io_evmask(io_thread_loop, (struct ev_io*)w, EV_WRITE, 0);
+			con_io_cb(loop, (struct ev_io*)w, EV_WRITE);
+		}
 	}
-	g_listensock_queue.head = g_listensock_queue.tail = NULL;
-	pthread_mutex_unlock(&listensock_mutex);
+	// Receive and start queued write jobs >>>
 }
 
 //>>>
@@ -79,14 +134,58 @@ void close_t_cpu_cycles_fd(void* cdata) //<<<
 }
 
 //>>>
+void free_con_state(struct con_watch* w) //<<<
+{
+	struct con_state*	c = w->w.data;
+
+	if (c->body_fd != -1) {
+		close(c->body_fd);
+		c->body_fd = -1;
+	}
+	if (c->body_storage == BODY_STORAGE_MMAP) {
+		if (c->body != MAP_FAILED) {
+			if (munmap(c->body, c->body_avail)) {
+				perror("Error munmapping body tmpfile");
+			}
+			c->body = NULL;
+		}
+		c->body_storage = BODY_STORAGE_NONE;
+	}
+	mtagpool_free(&c->mtp);
+	{ // Cancel any uncompleted write jobs
+		struct write_job*	job;
+		while ((job = dlist_pop_head(&c->write_jobs))) {
+			// TODO: notify the failure (cancellation) of this write job somehow?
+			if (job->free_cb)
+				job->free_cb(job);
+		}
+	}
+	ts_log_output(c);
+	obstack_pool_release(c->logs);
+	obstack_pool_release(c->ob);
+	w->w.data = NULL;
+}
+
+//>>>
+static void close_con(struct con_watch* w) //<<<
+{
+	close(w->w.fd);
+	ev_io_stop(w->loop, (struct ev_io*)w);
+	free_con_state(w);
+	free(w);
+	w = NULL;
+}
+
+//>>>
 static void* thread_start(void* cdata) //<<<
 {
 	struct perf_event_attr	pe = {0};
+	int						evfd = *(int*)cdata;
 
 	io_thread_loop = ev_loop_new(EVFLAG_AUTO);
 	if (io_thread_loop == NULL) {
 		fprintf(stderr, "Could not initialize thread loop\n");
-		pthread_exit(NULL);
+		goto failed;
 	}
 
 	ev_async_init(&io_thread_wakeup, io_thread_wakeup_cb);
@@ -104,7 +203,7 @@ static void* thread_start(void* cdata) //<<<
 	t_cpu_cycles_fd = perf_event_open(&pe, 0, -1, -1, 0);
 	if (t_cpu_cycles_fd == -1) {
 		perror("Could not open t_cpu_cycles_fd");
-		pthread_exit(NULL);
+		goto failed;
 	}
 
 	pthread_cleanup_push(close_t_cpu_cycles_fd, NULL);
@@ -164,11 +263,18 @@ static void* thread_start(void* cdata) //<<<
 
 	printf("In thread %ld\n", pthread_self());
 
+	// Signal readiness
+	write(evfd, &(uint64_t){0+256}, sizeof(uint64_t));
+
 	ev_run(io_thread_loop, 0);
 	ev_loop_destroy(io_thread_loop);
 
 	pthread_cleanup_pop(1);
 	return NULL;
+
+failed:
+	write(evfd, &(uint64_t){-1+256}, sizeof(uint64_t));
+	pthread_exit(NULL);
 }
 
 //>>>
@@ -246,21 +352,6 @@ void release_write_job_obstack(void* jobPtr) //<<<
 }
 
 //>>>
-void modify_io_evmask(struct ev_loop* loop, struct ev_io* w, int set, int clear) //<<<
-{
-	const int evmask	= (w->events | set) & ~clear;
-
-	ev_io_stop(loop, w);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wparentheses"
-	ev_io_modify(w, evmask);
-#pragma GCC diagnostic pop
-	if (evmask & (EV_READ|EV_WRITE)) {
-		ev_io_start(loop, w);
-	}
-}
-
-//>>>
 struct con_state* init_con_state(enum con_role role) //<<<
 {
 	uint64_t			now = nanoseconds_process_cpu();
@@ -297,46 +388,13 @@ struct con_state* init_con_state(enum con_role role) //<<<
 }
 
 //>>>
-void free_con_state(struct con_watch* w) //<<<
-{
-	struct con_state*	c = w->w.data;
-
-	if (c->body_fd != -1) {
-		close(c->body_fd);
-		c->body_fd = -1;
-	}
-	if (c->body_storage == BODY_STORAGE_MMAP) {
-		if (c->body != MAP_FAILED) {
-			if (munmap(c->body, c->body_avail)) {
-				perror("Error munmapping body tmpfile");
-			}
-			c->body = NULL;
-		}
-		c->body_storage = BODY_STORAGE_NONE;
-	}
-	mtagpool_free(&c->mtp);
-	{ // Cancel any uncompleted write jobs
-		struct write_job*	job;
-		while ((job = dlist_pop_head(&c->write_jobs))) {
-			// TODO: notify the failure (cancellation) of this write job somehow?
-			if (job->free_cb)
-				job->free_cb(job);
-		}
-	}
-	ts_log_output(c);
-	obstack_pool_release(c->logs);
-	obstack_pool_release(c->ob);
-	w->w.data = NULL;
-}
-
-//>>>
 void con_io_cb(struct ev_loop* loop, struct ev_io* _w, int revents) //<<<
 {
 	struct con_watch*	w = (struct con_watch*)_w;
 	struct con_state*	c = w->w.data;
 
 	if (c == NULL)
-		c = init_con_state(w->role);
+		w->w.data = c = init_con_state(w->role);
 
 	ts_puts(c, "con_io_cb", sizeof("con_io_cb")-1);
 	if (revents & EV_WRITE) { // Write any waiting data we can <<<
@@ -697,12 +755,7 @@ loop:
 	return;
 
 close:
-	close(w->w.fd);
-	ev_io_stop(loop, (struct ev_io*)w);
-	free_con_state(w);
-	c = NULL;
-	free(w);
-	w = NULL;
+	close_con(w);
 	return;
 
 close_400:
@@ -780,10 +833,8 @@ close_500:
 	
 
 message_complete:
-	if (w)
-		modify_io_evmask(loop, (struct ev_io*)w, 0, EV_READ|EV_WRITE);
-	/*
 	ts_puts(c, "Message complete", sizeof("Message complete"));
+	/*
 	// TODO: dispatch callback for message
 	struct obstack* ob = obstack_pool_get(OBSTACK_POOL_SMALL);
 	const uint64_t	ser1 = nanoseconds_process_cpu();
@@ -798,11 +849,31 @@ message_complete:
 	}
 	obstack_pool_release(ob); ob = NULL;
 	*/
+	/*
 	pthread_mutex_lock(&w->listener->requests_mutex);
 	dlist_append(&w->listener->requests, c);
 	pthread_mutex_unlock(&w->listener->requests_mutex);
 
 	ev_async_send(w->listener->requests_loop, &w->listener->requests_ready);
+	*/
+
+	// Post this completed message to the thread owning the queue
+	const uint64_t	p1 = nanoseconds_process_cpu();
+	modify_io_evmask(loop, (struct ev_io*)w, 0, EV_READ|EV_WRITE);
+	pthread_mutex_lock(&w->listener->msg_queue->msgs_mutex);
+	dlist_append(&w->listener->msg_queue->msgs, w);
+	pthread_mutex_unlock(&w->listener->msg_queue->msgs_mutex);
+
+	const ssize_t wrote = write(w->listener->msg_queue->evfd, &(uint64_t){1}, sizeof(uint64_t));
+	if (-1 == wrote) {
+		perror("Writing to msg_queue notify eventfd");
+		// TODO: what?
+	}
+
+	c = NULL; w = NULL; // ownership transferred to receiving thread
+	const uint64_t	p2 = nanoseconds_process_cpu();
+	printf("Posted complete message to msg_queue owner thread: %ld cycles\n", p2-p1);
+
 	return;
 }
 
@@ -825,15 +896,17 @@ void accept_cb(struct ev_loop* loop, struct ev_io* _w, int revents) //<<<
 	con_watch = malloc(sizeof *con_watch);
 	con_watch->listener = w;
 	con_watch->role = CON_ROLE_SERVER;
+	con_watch->loop = loop;
 	//ev_io_init((struct ev_io*)con_watch, con_io_cb, con_fd, EV_READ);
 	ev_init((struct ev_io*)con_watch, con_io_cb);
 	ev_io_set((struct ev_io*)con_watch, con_fd, EV_READ);
 	con_watch->w.data = NULL;
-	ev_io_start(loop, (struct ev_io*)con_watch);
-	con_io_cb(loop, (struct ev_io*)con_watch, EV_READ);	// Optimistically assume there is already data for us, rather than waiting for the readable event
+	ev_io_start(con_watch->loop, (struct ev_io*)con_watch);
+	con_io_cb(con_watch->loop, (struct ev_io*)con_watch, EV_READ);	// Optimistically assume there is already data for us, rather than waiting for the readable event
 }
 
 //>>>
+#if 0
 void requests_ready_cb(struct ev_loop* loop, struct ev_async* w, int revents) //<<<
 {
 	struct listensock*		listensock = w->data;
@@ -854,13 +927,14 @@ void requests_ready_cb(struct ev_loop* loop, struct ev_async* w, int revents) //
 }
 
 //>>>
-void start_listen(const char* node, const char* service) //<<<
+#endif
+void start_listen(struct msg_queue* q, const char* node, const char* service) //<<<
 {
 	struct addrinfo		hints;
 	struct addrinfo*	res = NULL;
 	struct addrinfo*	addr = NULL;
 	struct listensock*	accept_watch = NULL;
-	int					ev_pipe[2];
+	//int					ev_pipe[2];
 	int					rc;
 
 	memset(&hints, 0, sizeof hints);
@@ -902,6 +976,7 @@ void start_listen(const char* node, const char* service) //<<<
 			exit(EXIT_FAILURE);
 		}
 
+		/*
 		if (-1 == pipe(ev_pipe)) {
 			perror("Could not create ev_pipe");
 			exit(EXIT_FAILURE);
@@ -922,19 +997,150 @@ void start_listen(const char* node, const char* service) //<<<
 			perror("Could not set O_NONBLOCK and FD_CLOEXEC on ev_pipe");
 			exit(EXIT_FAILURE);
 		}
+		*/
 
 		accept_watch = malloc(sizeof *accept_watch);
 		memset(accept_watch, 0, sizeof *accept_watch);
+		accept_watch->msg_queue = q;
+		/*
 		pthread_mutex_init(&accept_watch->requests_mutex, NULL);
 		accept_watch->requests_loop = main_loop;
 		accept_watch->requests_ready.data = accept_watch;
+		*/
+		/*
 		ev_async_init(&accept_watch->requests_ready, requests_ready_cb);
+		*/
 		ev_io_init((struct ev_io*)accept_watch, accept_cb, listen_fd_http, EV_READ);
 		post_listensock(accept_watch);
 
-		ev_async_start(main_loop, &accept_watch->requests_ready);
+		//ev_async_start(main_loop, &accept_watch->requests_ready);
 	}
 	freeaddrinfo(res);
+}
+
+//>>>
+void got_msg_cb(struct con_watch* w) //<<<
+{
+	struct con_state*	c = w->w.data;
+	struct obstack*		ob = obstack_pool_get(OBSTACK_POOL_SMALL);
+
+#undef MSG
+#define MSG "got_msg_cb"
+	ts_puts(c, MSG, sizeof(MSG)-1);
+	ts_log_output(c);
+
+	c->status_numeric = 501;		// Not implemented
+#define REASON	"Not Implemented"
+
+	// Assemble body
+	obstack_grow(ob, REASON, sizeof(REASON)-1);
+	const size_t			body_len = obstack_object_size(ob);
+	const unsigned char*	body = obstack_finish(ob);
+
+	init_headers(&c->out_headers);
+#define ADD_STATIC_HEADER(hdrname, strval) \
+	do { \
+		struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
+		h->field_name = HDR_OTHER; \
+		h->field_name_str = (unsigned char*)hdrname; \
+		h->field_name_str_len = sizeof(hdrname)-1; \
+		h->field_value.str = (unsigned char*)strval; \
+		append_header(&c->out_headers, h); \
+	} while(0);
+
+	ADD_STATIC_HEADER("Server",			"evhttp 0.1");
+	// TODO: Date, etc
+	ADD_STATIC_HEADER("Connection",		"close");
+	ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
+
+	struct header*	h = obstack_alloc(ob, sizeof(struct header));
+	h->field_name = HDR_CONTENT_LENGTH;
+	h->field_value.integer = body_len;
+	append_header(&c->out_headers, h);
+
+#define HTTPVER	"HTTP/1.1"
+	obstack_grow(ob, HTTPVER, sizeof(HTTPVER)-1);
+	unsigned char* statusbase = obstack_base(ob) + obstack_object_size(ob);
+	obstack_blank(ob, 5);
+	statusbase[0] = ' ';
+	statusbase[1] = ((c->status_numeric / 100) % 10) + '0';
+	statusbase[2] = ((c->status_numeric / 10 ) % 10) + '0';
+	statusbase[3] = ((c->status_numeric      ) % 10) + '0';
+	statusbase[4] = ' ';
+	obstack_grow(ob, REASON "\r\n", sizeof(REASON "\r\n")-1);
+
+	if (serialize_headers(ob, &c->out_headers)) {
+		ts_puts(c, "Error serializing headers", sizeof("Error serializing headers"));
+		close_con(w);
+		return;
+	}
+
+	const size_t			hdrbuf_len = obstack_object_size(ob);
+	const unsigned char*	hdrbuf = obstack_finish(ob);
+	struct write_job*		write_headers = obstack_alloc(ob, sizeof *write_headers);
+	memset(write_headers, 0, sizeof *write_headers);
+	write_headers->source = WRITE_SOURCE_BUF;
+	write_headers->src.buf.len = hdrbuf_len;
+	write_headers->src.buf.buf = hdrbuf;
+	write_headers->action = WRITE_COMPLETE_IGNORE;
+	dlist_append(&c->write_jobs, write_headers);
+	
+
+	struct write_job*		write_body = obstack_alloc(ob, sizeof *write_body);
+	memset(write_body, 0, sizeof *write_body);
+	write_body->source = WRITE_SOURCE_BUF;
+	write_body->src.buf.len = body_len;
+	write_body->src.buf.buf = body;
+	write_body->action = WRITE_COMPLETE_CLOSE;
+	write_body->ob = ob;
+	write_body->free_cb = &release_write_job_obstack;
+	dlist_append(&c->write_jobs, write_body);
+
+#undef MSG
+#define MSG	"Constructed response"
+	ts_puts(c, MSG, sizeof(MSG)-1);
+
+	uint64_t	q1 = nanoseconds_process_cpu();
+	// TODO: pass back to the io_thread to write the data out to the socket
+	pthread_mutex_lock(&write_message_queue_mutex);
+	dlist_append(&g_write_message_queue, w);
+	w = NULL; c = NULL;		// Ownership transferred to io thread
+	pthread_mutex_unlock(&write_message_queue_mutex);
+
+	ev_async_send(io_thread_loop, &io_thread_wakeup);
+	uint64_t	q2 = nanoseconds_process_cpu();
+
+	printf("Queued write job for io thread: %ld cycles\n", q2-q1);
+}
+
+//>>>
+struct msg_queue* new_msg_queue(int epollfd, msg_handler* cb) //<<<
+{
+	struct msg_queue*	q = malloc(sizeof *q);
+	struct epoll_event	ev;
+
+	memset(q, 0, sizeof *q);
+	pthread_mutex_init(&q->msgs_mutex, NULL);
+	q->evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	q->cb = cb;
+
+	ev.events = EPOLLIN;
+	ev.data.fd = q->evfd;
+	if (-1 == epoll_ctl(epollfd, EPOLL_CTL_ADD, q->evfd, &ev)) {
+		perror("epoll_ctl msg_queue evfd");
+		goto failed;
+	}
+
+	return q;
+
+failed:
+	if (q) {
+		if (q->evfd)
+			close(q->evfd);
+		free(q);
+		q = NULL;
+	}
+	return NULL;
 }
 
 //>>>
@@ -942,6 +1148,25 @@ int main(int argc, char** argv) //<<<
 {
 	pthread_t		tid;
 	pthread_attr_t	attr;
+#define MAX_EVENTS	10
+	struct epoll_event	events[MAX_EVENTS];
+	struct epoll_event	ev;
+	int					rc;
+	int					io_thread_started;
+
+	main_loop_epoll_fd = epoll_create1(0);
+	if (-1 == main_loop_epoll_fd) {
+		perror("Could not create epoll instance");
+		exit(EXIT_FAILURE);
+	}
+
+	io_thread_started = eventfd(0, EFD_CLOEXEC);
+	ev.events = EPOLLIN;
+	ev.data.fd = io_thread_started;
+	if (epoll_ctl(main_loop_epoll_fd, EPOLL_CTL_ADD, io_thread_started, &ev) == -1) {
+		perror("epoll_ctl: io_thread_started");
+		exit(EXIT_FAILURE);
+	}
 
 	main_loop = ev_default_loop(EVFLAG_AUTO);
 
@@ -962,16 +1187,87 @@ int main(int argc, char** argv) //<<<
 
 	PTHREAD_OK(pthread_attr_init(&attr), "pthread_attr_init failed");
 	PTHREAD_OK(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED), "pthread_attr_setdetachstate failed");
-	PTHREAD_OK(pthread_create(&tid, &attr, thread_start, NULL), "pthread_create failed");
+	PTHREAD_OK(pthread_create(&tid, &attr, thread_start, &io_thread_started), "pthread_create failed");
 	PTHREAD_OK(pthread_attr_destroy(&attr), "pthread_attr_destroy failed");
 
-	// TODO: properly wait for our io_thread to be ready to receive the async wakeup
-	usleep(10000);
-	start_listen("0.0.0.0", "1080");
-	start_listen("::1", "1080");
+#if 0
+	// Wait for the io thread to start up.  Since the only fd registed so far is io_thread_started, we just wait
+	// for anything to be ready
+	do {
+		nfds = epoll_wait(main_loop_epoll_fd, events, MAX_EVENTS, 500);
+		if (-1 == nfds) {
+			perror("epoll_wait for io_thread_started");
+			exit(EXIT_FAILURE);
+		}
+	} while (nfds == 0);
+#endif
+	uint64_t val;
+	rc = read(io_thread_started, &val, sizeof val);
+	if (-1 == rc) {
+		perror("Read io_thread_started eventfd");
+		exit(EXIT_FAILURE);
+	}
+	val -= 256;
+	printf("Got io_thread startup result: %ld\n", val);
+	if (-1 == val) {
+		fprintf(stderr, "io thread startup failed\n");
+		goto failed;
+	}
+	close(io_thread_started);
 
-	ev_run(main_loop, 0);
+	// Create a queue for receiving messages from our listening sockets
+	struct msg_queue*	q = new_msg_queue(main_loop_epoll_fd, got_msg_cb);
 
+	pthread_rwlock_wrlock(&msg_queues_rwlock);
+	dlist_append(&msg_queues, q);
+	pthread_rwlock_unlock(&msg_queues_rwlock);
+
+	start_listen(q, "0.0.0.0", "1080");
+	start_listen(q, "::1", "1080");
+
+	//ev_run(main_loop, 0);
+	while (1) {
+		const int nfds = epoll_wait(main_loop_epoll_fd, events, MAX_EVENTS, -1);
+		if (-1 == nfds) {
+			perror("epoll_wait");
+			goto failed;
+		}
+		pthread_rwlock_rdlock(&msg_queues_rwlock);
+		for (int i=0; i<nfds; i++) {
+			struct msg_queue*	q = dlist_head(&msg_queues);
+			uint64_t			val;
+
+			if (-1 == read(events[i].data.fd, &val, sizeof val)) {
+				if (errno == EAGAIN) continue;
+				perror("Read msg_queue evfd");
+				// TODO: what?
+				goto poll_error;
+			}
+			if (val == 0) continue;
+			printf("Woke up for msg_queue fd %d with %ld events\n", events[i].data.fd, val);
+
+			// Search the msg queues for this fd and dispatch any messages queued for it
+			while (q) {
+				if (events[i].data.fd == q->evfd) {
+					struct dlist		msgs;
+					struct con_watch*	w;
+
+					pthread_mutex_lock(&q->msgs_mutex);
+					msgs = q->msgs;
+					q->msgs.head = q->msgs.tail = NULL;
+					pthread_mutex_unlock(&q->msgs_mutex);
+
+					while ((w = dlist_pop_head(&msgs)))
+						q->cb(w);
+				}
+				q = q->dl.next;
+			}
+		}
+poll_error:
+		pthread_rwlock_unlock(&msg_queues_rwlock);
+	}
+
+failed:
 	pthread_exit(NULL);
 }
 

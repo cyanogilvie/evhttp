@@ -12,10 +12,15 @@ STATIC_FMT = local/lib/libfmt.a
 CC = gcc
 CXX = g++
 RE2C = local/bin/re2c
+VALGRIND = valgrind
 
 #RE2COPTS = --conditions --computed-gotos --nested-ifs --case-ranges -W -Wno-nondeterministic-tags --storable-state
 #RE2COPTS = --conditions --nested-ifs --case-ranges -W -Wno-nondeterministic-tags --storable-state
 RE2COPTS = --case-ranges -W -Wno-nondeterministic-tags
+
+VALGRINDARGS	= --tool=memcheck --num-callers=8 --leak-resolution=high \
+		  --leak-check=yes -v --suppressions=suppressions --keep-debuginfo=yes \
+		  --trace-children=yes
 
 RE2C_SOURCE_STORABLE = msg.c
 RE2C_SOURCE_PLAIN = http_headers.c report.c
@@ -130,12 +135,15 @@ vim-gdb-optimized: serv tags
 vim-gdb-re2c: local/bin/re2c
 	vim -c "set number" -c "set mouse=a" -c "set foldlevel=100" -c "Termdebug -ex set\ print\ pretty\ on --args local/bin/re2c $(REURIARGS) includetest.re -o includetest.c" -c "1windo set nonumber" -c "2windo set nonumber" deps/re2c/src/parse/scanner.cc
 
+valgrind: dbg_serv
+	$(VALGRIND) $(VALGRINDARGS) ./$<
+
 tags: $(addsuffix .c,$(BINS)) $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(CXX_OBJS)) common.re *.h local/include/*.h Makefile
 	ctags-exuberant --recurse=yes --langmap=c:+.re $(addsuffix .c,$(BINS)) $(subst .c,.re,$(RE2C_SOURCE)) $(subst .o,.c,$(C_OBJS)) $(subst .o,.cc,$(CXX_OBJS)) *.h common.re local/include/*.h
 
 clean:
 	-rm -rf core $(BINS) $(addprefix dbg_,$(BINS)) $(addsuffix .dot,$(BINS)) *.o tags $(RE2C_SOURCE) $(RE2C_HEADERS) build
 
-.PHONY: all clean vim-gdb vim-gdb-optimized
+.PHONY: all clean vim-gdb vim-gdb-optimized valgrind
 
 .SILENT: deps

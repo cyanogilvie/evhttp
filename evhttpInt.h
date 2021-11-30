@@ -26,6 +26,8 @@
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
 #include <x86intrin.h>
+#include <sys/eventfd.h>
+#include <sys/epoll.h>
 #include "ev.h"
 #include "fmtshim.h"
 #include "murmur3shim.h"
@@ -42,10 +44,7 @@ struct listensock_queue {
 
 struct listensock {
 	struct ev_io		accept_watcher;		// Must be first
-	struct ev_loop*		requests_loop;
-	struct ev_async		requests_ready;		// triggered when new requests are added
-	pthread_mutex_t		requests_mutex;
-	struct dlist		requests;			// dlist of struct con_state that have requests ready.  Access must use requests_mutex
+	struct msg_queue*	msg_queue;
 	struct listensock*	next;
 };
 
@@ -56,6 +55,7 @@ enum con_role {
 
 struct con_watch {
 	struct ev_io		w;					// Must be first
+	struct ev_loop*		loop;
 	enum con_role		role;
 	struct listensock*	listener;
 };
@@ -375,6 +375,7 @@ void ts_puts(struct con_state* c, char*const str, int len);
 			l = l->next; \
 		} \
 		fflush(stdout); \
+		obstack_free(c->logs, c->logs_head); \
 	} while(0)
 
 #endif

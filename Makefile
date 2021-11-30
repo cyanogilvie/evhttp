@@ -18,9 +18,10 @@ VALGRIND = valgrind
 #RE2COPTS = --conditions --nested-ifs --case-ranges -W -Wno-nondeterministic-tags --storable-state
 RE2COPTS = --case-ranges -W -Wno-nondeterministic-tags
 
+VALGRINDARGS_EXTRA = 
 VALGRINDARGS	= --tool=memcheck --num-callers=8 --leak-resolution=high \
 		  --leak-check=yes -v --suppressions=suppressions --keep-debuginfo=yes \
-		  --trace-children=yes
+		  --trace-children=yes $(VALGRINDARGS_EXTRA)
 
 RE2C_SOURCE_STORABLE = msg.c
 RE2C_SOURCE_PLAIN = http_headers.c report.c

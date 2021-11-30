@@ -264,7 +264,11 @@ static void* thread_start(void* cdata) //<<<
 	printf("In thread %ld\n", pthread_self());
 
 	// Signal readiness
-	write(evfd, &(uint64_t){0+256}, sizeof(uint64_t));
+	if (-1 == write(evfd, &(uint64_t){0+256}, sizeof(uint64_t))) {
+		perror("Write to evfd to signal io_thread readiness");
+		// TODO: what?
+		goto failed;
+	}
 
 	ev_run(io_thread_loop, 0);
 	ev_loop_destroy(io_thread_loop);
@@ -273,7 +277,11 @@ static void* thread_start(void* cdata) //<<<
 	return NULL;
 
 failed:
-	write(evfd, &(uint64_t){-1+256}, sizeof(uint64_t));
+	if (-1 == write(evfd, &(uint64_t){-1+256}, sizeof(uint64_t))) {
+		perror("Write to evfd to signal io_thread startup failure");
+		// TODO: what?
+		goto failed;
+	}
 	pthread_exit(NULL);
 }
 
@@ -368,6 +376,7 @@ struct con_state* init_con_state(enum con_role role) //<<<
 	c->state			= -1;
 	c->status			= CON_STATUS_WAITING;
 	c->status_code[0]	= 0;
+	c->status_numeric	= 0;
 	c->role				= role;
 	c->method			= METHOD_UNSPECIFIED;
 	c->custom_method	= NULL;
@@ -380,6 +389,8 @@ struct con_state* init_con_state(enum con_role role) //<<<
 	c->body_storage		= BODY_STORAGE_NONE;
 	c->body_fd			= -1;
 	c->chunk_remain		= 0;
+	c->write_jobs.head	= NULL;
+	c->write_jobs.tail	= NULL;
 
 	init_headers(&c->headers);
 	init_headers(&c->out_headers);
@@ -770,6 +781,7 @@ close_400:
 		const unsigned char*	body = obstack_finish(ob);
 
 		init_headers(&c->out_headers);
+#undef ADD_STATIC_HEADER
 #define ADD_STATIC_HEADER(hdrname, strval) \
 		do { \
 			struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
@@ -1037,7 +1049,11 @@ void got_msg_cb(struct con_watch* w) //<<<
 	const size_t			body_len = obstack_object_size(ob);
 	const unsigned char*	body = obstack_finish(ob);
 
+	memset(&c->out_headers, 0, sizeof(struct headers));
 	init_headers(&c->out_headers);
+	c->out_headers.dl.head = NULL;
+	c->out_headers.dl.tail = NULL;
+#undef ADD_STATIC_HEADER
 #define ADD_STATIC_HEADER(hdrname, strval) \
 	do { \
 		struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
@@ -1045,6 +1061,7 @@ void got_msg_cb(struct con_watch* w) //<<<
 		h->field_name_str = (unsigned char*)hdrname; \
 		h->field_name_str_len = sizeof(hdrname)-1; \
 		h->field_value.str = (unsigned char*)strval; \
+		h->dl.next = h->dl.prev = NULL; \
 		append_header(&c->out_headers, h); \
 	} while(0);
 
@@ -1056,6 +1073,7 @@ void got_msg_cb(struct con_watch* w) //<<<
 	struct header*	h = obstack_alloc(ob, sizeof(struct header));
 	h->field_name = HDR_CONTENT_LENGTH;
 	h->field_value.integer = body_len;
+	h->dl.next = h->dl.prev = NULL;
 	append_header(&c->out_headers, h);
 
 #define HTTPVER	"HTTP/1.1"
@@ -1078,11 +1096,15 @@ void got_msg_cb(struct con_watch* w) //<<<
 	const size_t			hdrbuf_len = obstack_object_size(ob);
 	const unsigned char*	hdrbuf = obstack_finish(ob);
 	struct write_job*		write_headers = obstack_alloc(ob, sizeof *write_headers);
-	memset(write_headers, 0, sizeof *write_headers);
 	write_headers->source = WRITE_SOURCE_BUF;
 	write_headers->src.buf.len = hdrbuf_len;
 	write_headers->src.buf.buf = hdrbuf;
+	write_headers->src.buf.written = 0;
 	write_headers->action = WRITE_COMPLETE_IGNORE;
+	write_headers->ob = NULL;
+	write_headers->free_cb = NULL;
+	write_headers->notify_loop = NULL;
+	write_headers->notify_w = NULL;
 	dlist_append(&c->write_jobs, write_headers);
 	
 
@@ -1091,9 +1113,12 @@ void got_msg_cb(struct con_watch* w) //<<<
 	write_body->source = WRITE_SOURCE_BUF;
 	write_body->src.buf.len = body_len;
 	write_body->src.buf.buf = body;
+	write_body->src.buf.written = 0;
 	write_body->action = WRITE_COMPLETE_CLOSE;
 	write_body->ob = ob;
 	write_body->free_cb = &release_write_job_obstack;
+	write_headers->notify_loop = NULL;
+	write_headers->notify_w = NULL;
 	dlist_append(&c->write_jobs, write_body);
 
 #undef MSG

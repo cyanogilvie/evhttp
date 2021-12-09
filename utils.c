@@ -49,7 +49,7 @@ long perf_event_open(struct perf_event_attr* hw_event, pid_t pid, int cpu, int g
 
 //>>>
 
-void ts_puts(struct con_state* c, char*const str, int len)
+void ts_puts(struct evhttp_con* c, char*const str, int len)
 {
 	const uint64_t	now = nanoseconds_process_cpu();
 	struct log*		l = obstack_alloc(c->logs, sizeof *l);
@@ -70,7 +70,7 @@ void ts_puts(struct con_state* c, char*const str, int len)
 
 #if 0
 	const uint64_t log_before = nanoseconds_process_cpu();
-		struct con_state* cl = (c); \
+		struct evhttp_con* cl = (c); \
 		const uint64_t cycles = nanoseconds_since(cl->accept_time); \
 		double delta = cycles / 1e3; \
 		double last_delta = delta - cl->last_log; \

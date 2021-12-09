@@ -3,14 +3,14 @@
 
 #include <obstack.h>
 
-#define FAKE_TEMPLATE_APPEND_INT_DECL(func, type) \
-	size_t func(struct obstack* ob, type val);
+#define FAKE_TEMPLATE_APPEND_INT_DECL(type) \
+	size_t fmt_obstack_append_##type(struct obstack* ob, type val);
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-	FAKE_TEMPLATE_APPEND_INT_DECL(fmt_obstack_append_int,		int);
-	FAKE_TEMPLATE_APPEND_INT_DECL(fmt_obstack_append_size_t,	size_t);
+	FAKE_TEMPLATE_APPEND_INT_DECL(int);
+	FAKE_TEMPLATE_APPEND_INT_DECL(size_t);
 #ifdef __cplusplus
 }
 #endif

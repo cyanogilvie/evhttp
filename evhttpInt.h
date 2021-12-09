@@ -28,6 +28,7 @@
 #include <x86intrin.h>
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
+#include "evhttp.h"
 #include "ev.h"
 #include "fmtshim.h"
 #include "murmur3shim.h"
@@ -35,7 +36,18 @@
 #include "mtag.h"
 #include "obstack_pool.h"
 
+#define ERR(...) (evhttp_err){__VA_ARGS__}
+#define STATIC_STR(str)	str, sizeof(str)-1
+
+typedef void (refcount_free)(void* thing);
+#define REFCOUNTED(free) int refcount; refcount_free*
+
 extern thread_local int	t_cpu_cycles_fd;
+
+struct evhttp {
+	int					epollfd;
+	struct msg_queue*	q;
+};
 
 struct listensock_queue {
 	struct listensock* head;
@@ -60,19 +72,6 @@ struct con_watch {
 	struct listensock*	listener;
 };
 
-/*
-enum ev_type {
-	EV_PIPE_NEWCON,
-	EV_PIPE_REQ,
-	EV_PIPE_CONCLOSED
-};
-
-struct ev_pipe_event {
-	enum ev_type	type;
-	void*			data;
-};
-*/
-
 enum con_status {
 	CON_STATUS_UNDEF=0,
 	CON_STATUS_WAITING,
@@ -80,19 +79,6 @@ enum con_status {
 	CON_STATUS_ERROR,
 	CON_STATUS_BODY,
 	CON_STATUS_BODY_DONE
-};
-
-enum ev_methods {
-	METHOD_UNSPECIFIED=0,
-	METHOD_GET,
-	METHOD_HEAD,
-	METHOD_POST,
-	METHOD_PUT,
-	METHOD_DELETE,
-	METHOD_CONNECT,
-	METHOD_OPTIONS,
-	METHOD_TRACE,
-	METHOD_CUSTOM			// Custom method specified, string is in con_state.custom_method
 };
 
 enum con_flags {
@@ -194,6 +180,7 @@ struct write_job {
 		struct write_source_buf	buf;	// WRITE_SOURCE_BUF
 	} src;
 	write_job_free_cb*			free_cb;
+	void*						free_cdata;
 };
 
 #include "http_headers.h"
@@ -203,15 +190,15 @@ struct write_job {
 
 void lowercase(unsigned char* str);
 
-// TODO resolve these circular dependencies of struct con_state and these declarations
-//void mtagpool_clear(struct mtagpool* mtp, struct con_state* c);
-//void new_header_other(struct con_state* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len);
-//void new_header_str(struct con_state* c, enum hdr field_name, const unsigned char* field_value, int field_value_len);
-//int push_te(struct con_state* c, enum te_types type);
-//int push_te_accept(struct con_state* c, const unsigned char* r1, const unsigned char* r2, enum te_types type);
-uint64_t con_ts(struct con_state* c);	// Number of nanoseconds since accept
+// TODO resolve these circular dependencies of struct evhttp_con and these declarations
+//void mtagpool_clear(struct mtagpool* mtp, struct evhttp_con* c);
+//void new_header_other(struct evhttp_con* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len);
+//void new_header_str(struct evhttp_con* c, enum evhttp_hdr field_name, const unsigned char* field_value, int field_value_len);
+//int push_te(struct evhttp_con* c, enum te_types type);
+//int push_te_accept(struct evhttp_con* c, const unsigned char* r1, const unsigned char* r2, enum te_types type);
+uint64_t con_ts(struct evhttp_con* c);	// Number of nanoseconds since accept
 
-static inline void mtagpool_clear(struct mtagpool* mtp, struct con_state* c) //<<<
+static inline void mtagpool_clear(struct mtagpool* mtp, struct evhttp_con* c) //<<<
 {
 	obstack_free(mtp->ob, mtp->start);
 	mtp->start = obstack_alloc(mtp->ob, 1);
@@ -219,11 +206,11 @@ static inline void mtagpool_clear(struct mtagpool* mtp, struct con_state* c) //<
 }
 
 //>>>
-static inline void new_header_other(struct con_state* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len) //<<<
+static inline void new_header_other(struct evhttp_con* c, const unsigned char* field_name_str, int field_name_str_len, const unsigned char* field_value, int field_value_len) //<<<
 {
 	struct header*	hdr = new_header(c->ob);
 
-	hdr->field_name			= HDR_OTHER;
+	hdr->field_name			= EVHTTP_HDR_OTHER;
 	hdr->field_name_str		= obstack_copy0(c->ob, field_name_str, field_name_str_len);
 	hdr->field_name_str_len	= field_name_str_len;
 	hdr->field_value.str	= obstack_copy0(c->ob, field_value, field_value_len);
@@ -234,7 +221,7 @@ static inline void new_header_other(struct con_state* c, const unsigned char* fi
 }
 
 //>>>
-static inline void new_header_str(struct con_state* c, enum hdr field_name, const unsigned char* field_value, int field_value_len) //<<<
+static inline void new_header_str(struct evhttp_con* c, enum evhttp_hdr field_name, const unsigned char* field_value, int field_value_len) //<<<
 {
 	struct header*	hdr = new_header(c->ob);
 
@@ -245,16 +232,16 @@ static inline void new_header_str(struct con_state* c, enum hdr field_name, cons
 }
 
 //>>>
-static inline int push_te(struct con_state* c, enum te_types type) //<<<
+static inline int push_te(struct evhttp_con* c, enum te_types type) //<<<
 {
 	struct header*	h;
 
 	/* Reject duplicates */
-	for (h = c->headers.first[HDR_TRANSFER_ENCODING]; h; h = h->type_next)
+	for (h = c->headers.first[EVHTTP_HDR_TRANSFER_ENCODING]; h; h = h->type_next)
 		if (h->field_value.integer == type) return 1;
 
 	h = new_header(c->ob);
-	h->field_name = HDR_TRANSFER_ENCODING;
+	h->field_name = EVHTTP_HDR_TRANSFER_ENCODING;
 	h->field_value.integer = type;
 	append_header(&c->headers, h);
 
@@ -262,14 +249,14 @@ static inline int push_te(struct con_state* c, enum te_types type) //<<<
 }
 
 //>>>
-static inline int push_te_accept(struct con_state* c, const unsigned char* r1, const unsigned char* r2, enum te_types type) //<<<
+static inline int push_te_accept(struct evhttp_con* c, const unsigned char* r1, const unsigned char* r2, enum te_types type) //<<<
 {
 	struct header*		h;
 	struct te_accept*	te;
 	float				rank = 0;
 
 	/* Reject duplicates */
-	for (h = c->headers.first[HDR_TE]; h; h = h->type_next) {
+	for (h = c->headers.first[EVHTTP_HDR_TE]; h; h = h->type_next) {
 		struct te_accept*	tmp_te = h->field_value.ptr;
 		if (tmp_te->type == type) return 1;
 	}
@@ -297,7 +284,7 @@ static inline int push_te_accept(struct con_state* c, const unsigned char* r1, c
 	}
 
 	h = new_header(c->ob);
-	h->field_name = HDR_TE;
+	h->field_name = EVHTTP_HDR_TE;
 	h->field_value.ptr = te = obstack_alloc(c->ob, sizeof *te);
 	te->rank = rank;
 	append_header(&c->headers, h);
@@ -325,7 +312,7 @@ struct log {
 #if 0
 #define ts_log(c, fmt, ...) \
 	do { \
-		struct con_state* cl = (c); \
+		struct evhttp_con* cl = (c); \
 		double delta = nanoseconds_since(cl->accept_time) / 1e3; \
 		double last_delta = delta - c->last_log; \
 		c->last_log = delta; \
@@ -363,7 +350,7 @@ struct log {
 	} while(0)
 #endif
 
-void ts_puts(struct con_state* c, char*const str, int len);
+void ts_puts(struct evhttp_con* c, char*const str, int len);
 
 #define ts_log_output(c) \
 	do { \

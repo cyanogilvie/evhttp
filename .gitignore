@@ -9,7 +9,6 @@ msg.c
 msg.h
 report.c
 report.h
-serv
 fmttest
 dbg_serv
 deps/libev
@@ -17,3 +16,6 @@ tags
 MurmurHash3.cc
 MurmurHash3.h
 re2c
+*.a
+dbg_testserv
+testserv

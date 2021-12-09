@@ -3,15 +3,16 @@
 /*!include:re2c "common.re" */
 
 /*!header:re2c:on */
-struct con_state {
+struct evhttp_con {
 	struct dlist_elem	dl;				// Must be first
 
 	enum con_role		role;
+	struct con_watch*	w;
 
 	uint64_t			accept_time;	// The first moment we became aware of the connection (nanoseconds resolution, cputime since process start)
 
 	// Valid for requests
-	enum ev_methods		method;
+	enum evhttp_method	method;
 	unsigned char*		custom_method;
 	unsigned char*		target;
 	struct cookie*		cookies;
@@ -19,8 +20,10 @@ struct con_state {
 	// Valid for responses
 	unsigned char		status_code[4];
 	int					status_numeric;
+	struct evhttp_buf	reason;
 	struct set_cookie*	set_cookies;
 	struct headers		out_headers;
+	struct write_job*	body_write_job;
 
 	// Valid for both requests and responses
 	int					connectionflags;
@@ -56,12 +59,12 @@ struct con_state {
 	unsigned char*		buf;
 };
 
-void shift_msg_buffer(struct con_state* c, size_t shift);
-void init_msg_buffer(struct con_state* c);
-enum con_status parse_http_message(struct con_state* c);
+void shift_msg_buffer(struct evhttp_con* c, size_t shift);
+void init_msg_buffer(struct evhttp_con* c);
+enum con_status parse_http_message(struct evhttp_con* c);
 /*!header:re2c:off */
 
-enum con_status parse_http_message(struct con_state* c) //<<<
+enum con_status parse_http_message(struct evhttp_con* c) //<<<
 {
 	unsigned int		yych, yyaccept;
     const unsigned char *h1, *h2, *h3, *h4, *m1, *m2, *v1, *v2, *r1, *r2, *st1, *l1, *l2, *l3, *l4, *l5, *l6, *end;
@@ -107,23 +110,19 @@ loop:
 		// Status line (client) >>>
 		// Request line (server) <<<
 		<reqline> crlf	:=> reqline		// RFC7230 3.5
-		<reqline>     'GET'		rws	=> reqline_target	{ c->method = METHOD_GET;		goto yyc_reqline_target; }
-		<reqline>     'HEAD'	rws	=> reqline_target	{ c->method = METHOD_HEAD;		goto yyc_reqline_target; }
-		<reqline>     'POST'	rws	=> reqline_target	{ c->method = METHOD_POST;		goto yyc_reqline_target; }
-		<reqline>     'PUT'		rws	=> reqline_target	{ c->method = METHOD_PUT;		goto yyc_reqline_target; }
-		<reqline>     'DELETE'	rws	=> reqline_target	{ c->method = METHOD_DELETE;	goto yyc_reqline_target; }
-		<reqline>     'CONNECT'	rws	=> reqline_target	{ c->method = METHOD_CONNECT;	goto yyc_reqline_target; }
-		<reqline>     'OPTIONS'	rws	=> reqline_target	{ c->method = METHOD_OPTIONS;	goto yyc_reqline_target; }
-		<reqline>     'TRACE'	rws	=> reqline_target	{ c->method = METHOD_TRACE;		goto yyc_reqline_target; }
+		<reqline>     'GET'		rws	=> reqline_target	{ c->method = EVHTTP_METHOD_GET;		goto yyc_reqline_target; }
+		<reqline>     'HEAD'	rws	=> reqline_target	{ c->method = EVHTTP_METHOD_HEAD;		goto yyc_reqline_target; }
+		<reqline>     'POST'	rws	=> reqline_target	{ c->method = EVHTTP_METHOD_POST;		goto yyc_reqline_target; }
+		<reqline>     'PUT'		rws	=> reqline_target	{ c->method = EVHTTP_METHOD_PUT;		goto yyc_reqline_target; }
+		<reqline>     'DELETE'	rws	=> reqline_target	{ c->method = EVHTTP_METHOD_DELETE;		goto yyc_reqline_target; }
+		<reqline>     'CONNECT'	rws	=> reqline_target	{ c->method = EVHTTP_METHOD_CONNECT;	goto yyc_reqline_target; }
+		<reqline>     'OPTIONS'	rws	=> reqline_target	{ c->method = EVHTTP_METHOD_OPTIONS;	goto yyc_reqline_target; }
+		<reqline>     'TRACE'	rws	=> reqline_target	{ c->method = EVHTTP_METHOD_TRACE;		goto yyc_reqline_target; }
 		<reqline> @m1 method @m2 rws => reqline_target	{ c->custom_method = obstack_copy0(c->ob, m1, (int)(m2-m1));	goto yyc_reqline_target; }
 
 		<reqline_target> @l1 request_target @l2 rws @l3 http_version @l4 crlf	=> header {
-#if 0
-			printf("method: target: (%.*s), ver: (%.*s)\n",
-					(int)(l2 - l1), l1,
-					(int)(v4 - v3), v3);
-#endif
-
+			c->target   = obstack_copy0(c->ob, l1, (int)(l2-l1));
+			c->http_ver = obstack_copy0(c->ob, l3, (int)(l4-l3));
 			goto yyc_header;
 		}
 		// Request line (server) >>>
@@ -173,8 +172,8 @@ loop:
 
 			// Invalid to have multiple Content-Length headers with different values
 			if (
-					c->headers.first[HDR_CONTENT_LENGTH] != NULL &&
-					c->headers.first[HDR_CONTENT_LENGTH]->field_value.integer != content_length
+					c->headers.first[EVHTTP_HDR_CONTENT_LENGTH] != NULL &&
+					c->headers.first[EVHTTP_HDR_CONTENT_LENGTH]->field_value.integer != content_length
 			) {
 				if (c->role == CON_ROLE_SERVER) {
 					// TODO: MUST close with 400 Bad Request
@@ -186,7 +185,7 @@ loop:
 			}
 
 			struct header* h = new_header(c->ob);
-			h->field_name = HDR_CONTENT_LENGTH;
+			h->field_name = EVHTTP_HDR_CONTENT_LENGTH;
 			h->field_value.integer = content_length;
 			append_header(&c->headers, h);
 
@@ -290,7 +289,7 @@ loop:
 			else if (l4)	c->connectionflags |= CON_UPGRADE;
 
 			struct header* h = new_header(c->ob);
-			h->field_name = HDR_CONNECTION;
+			h->field_name = EVHTTP_HDR_CONNECTION;
 			h->field_value.str = obstack_copy0(c->ob, l1, (int)(l6-l1));
 			append_header(&c->headers, h);
 
@@ -310,7 +309,7 @@ loop:
 		// Upgrade: >>>
 		// Content-Type: <<<
 		<header> "Content-Type:" ows media_type ows crlf	{
-			if (c->headers.first[HDR_CONTENT_TYPE]) {status = CON_STATUS_ERROR; goto finally;}
+			if (c->headers.first[EVHTTP_HDR_CONTENT_TYPE]) {status = CON_STATUS_ERROR; goto finally;}
 			struct media_type*	content_type = obstack_alloc(c->ob, sizeof *content_type);
 			content_type->media_type = obstack_copy0(c->ob, l1, (int)(l2-l1));
 			lowercase(content_type->media_type);
@@ -348,15 +347,15 @@ loop:
 		// Host: <<<
 		<header> "Host:" :=> host
 		<host> ows @l1 host (':' port)? @l2 ows crlf	=> header {
-			if (c->headers.first[HDR_HOST]) {status = CON_STATUS_ERROR; goto finally;}
-			new_header_str(c, HDR_HOST, l1, (int)(l2-l1));
+			if (c->headers.first[EVHTTP_HDR_HOST]) {status = CON_STATUS_ERROR; goto finally;}
+			new_header_str(c, EVHTTP_HDR_HOST, l1, (int)(l2-l1));
 			goto loop;
 		}
 		// Host: >>>
 		// User-Agent: <<<
 		<header> "User-Agent:" ows @l1 field_value @l2 ows crlf		{
-			if (c->headers.first[HDR_USER_AGENT]) {status = CON_STATUS_ERROR; goto finally;}
-			new_header_str(c, HDR_USER_AGENT, l1, (int)(l2-l1));
+			if (c->headers.first[EVHTTP_HDR_USER_AGENT]) {status = CON_STATUS_ERROR; goto finally;}
+			new_header_str(c, EVHTTP_HDR_USER_AGENT, l1, (int)(l2-l1));
 			goto loop;
 		}
 		// User-Agent: >>>
@@ -510,7 +509,7 @@ finally:
 }
 
 //>>>
-void shift_msg_buffer(struct con_state* c, size_t shift) //<<<
+void shift_msg_buffer(struct evhttp_con* c, size_t shift) //<<<
 {
 	memmove(c->buf, c->tok, c->buf_size - shift);
 	c->lim -= shift;
@@ -521,7 +520,7 @@ void shift_msg_buffer(struct con_state* c, size_t shift) //<<<
 }
 
 //>>>
-void init_msg_buffer(struct con_state* c) //<<<
+void init_msg_buffer(struct evhttp_con* c) //<<<
 {
 #define BUFSIZE	8192
 	c->buf_size = BUFSIZE;

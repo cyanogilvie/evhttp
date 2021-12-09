@@ -11,22 +11,16 @@ static void my_obstack_alloc_failed()
 struct timespec before;
 double empty = 0.0;
 
-static int					main_loop_epoll_fd = -1;
-static struct ev_loop*		main_loop = NULL;
 static struct ev_loop*		io_thread_loop = NULL;
 static struct ev_async		io_thread_wakeup;
-
-typedef void (msg_handler)(struct con_watch* w);
 
 struct msg_queue {
 	struct dlist_elem		dl;		// Must be first
 	int						evfd;
 	pthread_mutex_t			msgs_mutex;
 	struct dlist			msgs;
-	msg_handler*			cb;
+	evhttp_msg_handler*		cb;
 };
-pthread_rwlock_t	msg_queues_rwlock = PTHREAD_RWLOCK_INITIALIZER;
-struct dlist		msg_queues = {0};
 
 pthread_mutex_t		listensock_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -39,6 +33,9 @@ struct listensock_queue g_listensock_active = {
 	.head = NULL,
 	.tail = NULL
 };
+
+pthread_mutex_t		autoinit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int			autoinit_done = 0;
 
 pthread_mutex_t		write_message_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct dlist g_write_message_queue = {
@@ -136,7 +133,7 @@ void close_t_cpu_cycles_fd(void* cdata) //<<<
 //>>>
 void free_con_state(struct con_watch* w) //<<<
 {
-	struct con_state*	c = w->w.data;
+	struct evhttp_con*	c = w->w.data;
 
 	if (c->body_fd != -1) {
 		close(c->body_fd);
@@ -199,7 +196,7 @@ static void* thread_start(void* cdata) //<<<
 	pe.exclude_kernel = 0;
 	pe.exclude_hv = 1;
 
-	// Need to set /proc/sys/kernel/perf_event_paranoid to 0 to use without root
+	// Need to set /proc/sys/kernel/perf_event_paranoid to 0 or 1 to use without root
 	t_cpu_cycles_fd = perf_event_open(&pe, 0, -1, -1, 0);
 	if (t_cpu_cycles_fd == -1) {
 		perror("Could not open t_cpu_cycles_fd");
@@ -332,7 +329,7 @@ void ev_pipe_cb(struct ev_loop* loop, struct ev_io* w, int revents) //<<<
 #if 0
 void respond(struct ev_loop* loop, struct ev_io* w, int status, struct headers* headers, struct write_source* body, enum write_complete_action action) //<<<
 {
-	struct con_state*		c = w->data;
+	struct evhttp_con*		c = w->data;
 	struct write_job*		headers_job = obstack_alloc(c->ob, sizeof *headers_job);
 	struct write_job*		job = obstack_alloc(c->ob, sizeof *job);
 
@@ -360,11 +357,11 @@ void release_write_job_obstack(void* jobPtr) //<<<
 }
 
 //>>>
-struct con_state* init_con_state(enum con_role role) //<<<
+struct evhttp_con* init_con_state(enum con_role role) //<<<
 {
 	uint64_t			now = nanoseconds_process_cpu();
 	struct obstack*		ob = obstack_pool_get(OBSTACK_POOL_SMALL);
-	struct con_state*	c = obstack_alloc(ob, sizeof *c);
+	struct evhttp_con*	c = obstack_alloc(ob, sizeof *c);
 
 	c->ob				= ob;
 	c->logs				= obstack_pool_get(OBSTACK_POOL_SMALL);
@@ -376,9 +373,9 @@ struct con_state* init_con_state(enum con_role role) //<<<
 	c->state			= -1;
 	c->status			= CON_STATUS_WAITING;
 	c->status_code[0]	= 0;
-	c->status_numeric	= 0;
+	c->status_numeric	= 200;
 	c->role				= role;
-	c->method			= METHOD_UNSPECIFIED;
+	c->method			= EVHTTP_METHOD_UNSPECIFIED;
 	c->custom_method	= NULL;
 	c->http_ver			= NULL;
 	c->connectionflags	= 0;
@@ -402,10 +399,12 @@ struct con_state* init_con_state(enum con_role role) //<<<
 void con_io_cb(struct ev_loop* loop, struct ev_io* _w, int revents) //<<<
 {
 	struct con_watch*	w = (struct con_watch*)_w;
-	struct con_state*	c = w->w.data;
+	struct evhttp_con*	c = w->w.data;
 
-	if (c == NULL)
+	if (c == NULL) {
 		w->w.data = c = init_con_state(w->role);
+		c->w = w;
+	}
 
 	ts_puts(c, "con_io_cb", sizeof("con_io_cb")-1);
 	if (revents & EV_WRITE) { // Write any waiting data we can <<<
@@ -493,7 +492,7 @@ loop:
 			// Calculate (or estimate) how much we still need to read <<<
 			switch (c->body_len) {
 				case BODY_LEN_CONTENT_LENGTH:
-					remain = c->headers.first[HDR_CONTENT_LENGTH]->field_value.integer - c->body_size;
+					remain = c->headers.first[EVHTTP_HDR_CONTENT_LENGTH]->field_value.integer - c->body_size;
 					break;
 				case BODY_LEN_EOF:
 					remain = c->body_avail < 4096 ? 1048576 : c->body_avail;		// Just something large
@@ -511,6 +510,7 @@ loop:
 						obstack_blank(c->ob, remain);
 						c->body = obstack_base(c->ob);
 						c->body_avail = obstack_object_size(c->ob) + obstack_room(c->ob);
+						break;
 
 					case BODY_STORAGE_MMAP:
 						{
@@ -530,6 +530,7 @@ loop:
 							c->body = new;
 							c->body_avail = new_size;
 						}
+						break;
 
 					default:
 						fprintf(stderr, "Unhandled body_storage: %d\n", c->body_storage);
@@ -621,21 +622,21 @@ loop:
 
 					// Determine message body length as per RFC7230 section 3.3.3 <<<
 					if (
-							(c->role == CON_ROLE_CLIENT && c->method == METHOD_HEAD) ||
-							(c->role == CON_ROLE_CLIENT && c->method == METHOD_CONNECT) ||
+							(c->role == CON_ROLE_CLIENT && c->method == EVHTTP_METHOD_HEAD) ||
+							(c->role == CON_ROLE_CLIENT && c->method == EVHTTP_METHOD_CONNECT) ||
 							(c->status_numeric >= 100 && c->status_numeric <= 199) ||
 							c->status_numeric == 204 ||
 							c->status_numeric == 304
 					) {
 						// No body, regardless of any header fields that might indicate a length
 						c->body_len = BODY_LEN_NONE;
-					} else if (c->headers.first[HDR_TRANSFER_ENCODING]) { // Transfer-Encoding present
-						if (c->headers.first[HDR_CONTENT_LENGTH]) {
+					} else if (c->headers.first[EVHTTP_HDR_TRANSFER_ENCODING]) { // Transfer-Encoding present
+						if (c->headers.first[EVHTTP_HDR_CONTENT_LENGTH]) {
 							// MUST strip content_length if it was present
-							remove_header(&c->headers, c->headers.first[HDR_CONTENT_LENGTH]);
+							remove_header(&c->headers, c->headers.first[EVHTTP_HDR_CONTENT_LENGTH]);
 						}
 
-						if (last_header(&c->headers, HDR_TRANSFER_ENCODING)->field_value.integer == TE_CHUNKED) {
+						if (last_header(&c->headers, EVHTTP_HDR_TRANSFER_ENCODING)->field_value.integer == TE_CHUNKED) {
 							// Message length is determined by chunked transfer coding
 							c->body_len = BODY_LEN_CHUNKED;
 						} else {
@@ -647,7 +648,7 @@ loop:
 								goto close_400;
 							}
 						}
-					} else if (c->headers.first[HDR_CONTENT_LENGTH]) {
+					} else if (c->headers.first[EVHTTP_HDR_CONTENT_LENGTH]) {
 						// Content-Length gives the body length
 						c->body_len = BODY_LEN_CONTENT_LENGTH;
 					} else {
@@ -669,7 +670,7 @@ loop:
 							goto message_complete;
 						case BODY_LEN_CONTENT_LENGTH:
 							{
-								const int content_length = c->headers.first[HDR_CONTENT_LENGTH]->field_value.integer;
+								const int content_length = c->headers.first[EVHTTP_HDR_CONTENT_LENGTH]->field_value.integer;
 								if (content_length == 0)
 									goto message_complete;
 
@@ -774,6 +775,7 @@ close_400:
 	ts_puts(c, "Responding with 400 Bad Request", sizeof("Responding with 400 Bad Request")-1);
 	{
 		struct obstack*	ob = obstack_pool_get(OBSTACK_POOL_SMALL);
+		evhttp_err		err = {NULL, EVHTTP_OK};
 
 		// Assemble body
 		obstack_grow(ob, "Bad Request", sizeof("Bad Request")-1);
@@ -781,11 +783,10 @@ close_400:
 		const unsigned char*	body = obstack_finish(ob);
 
 		init_headers(&c->out_headers);
-#undef ADD_STATIC_HEADER
 #define ADD_STATIC_HEADER(hdrname, strval) \
 		do { \
 			struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
-			h->field_name = HDR_OTHER; \
+			h->field_name = EVHTTP_HDR_OTHER; \
 			h->field_name_str = (unsigned char*)hdrname; \
 			h->field_name_str_len = sizeof(hdrname)-1; \
 			h->field_value.str = (unsigned char*)strval; \
@@ -798,13 +799,14 @@ close_400:
 		ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
 
 		struct header*	h = obstack_alloc(ob, sizeof(struct header));
-		h->field_name = HDR_CONTENT_LENGTH;
+		h->field_name = EVHTTP_HDR_CONTENT_LENGTH;
 		h->field_value.integer = body_len;
 		append_header(&c->out_headers, h);
 
 		obstack_grow(ob, "HTTP/1.1 400 Bad Request\r\n", sizeof("HTTP/1.1 400 Bad Request\r\n")-1);
-		if (serialize_headers(ob, &c->out_headers)) {
-			ts_puts(c, "Error serializing headers", sizeof("Error serializing headers"));
+		err = serialize_headers(ob, &c->out_headers);
+		if (err.msg) {
+			ts_log(c, "Error serializing headers: %s", err.msg);
 			goto close;
 		}
 
@@ -834,15 +836,13 @@ close_400:
 
 		ts_puts(c, "Constucted and queued response", sizeof("Constucted and queued response")-1);
 		con_io_cb(loop, (struct ev_io*)w, EV_WRITE);
+#undef ADD_STATIC_HEADER
 	}
 	return;
 
 close_500:
 	// TODO: Respond with 500 Bad Request and close
 	goto close;
-	return;
-
-	
 
 message_complete:
 	ts_puts(c, "Message complete", sizeof("Message complete"));
@@ -871,15 +871,31 @@ message_complete:
 
 	// Post this completed message to the thread owning the queue
 	const uint64_t	p1 = nanoseconds_process_cpu();
+	evhttp_err		err = {NULL, EVHTTP_OK};
 	modify_io_evmask(loop, (struct ev_io*)w, 0, EV_READ|EV_WRITE);
 	pthread_mutex_lock(&w->listener->msg_queue->msgs_mutex);
-	dlist_append(&w->listener->msg_queue->msgs, w);
+	if (w->listener->msg_queue->cb == NULL) {
+		// The handler (listener / client) has shut down, nowhere to send this message
+		err = ERR("Receiver went away", EVHTTP_ERR_SEQUENCE);
+	}
+	if (err.msg == NULL)
+		dlist_append(&w->listener->msg_queue->msgs, w);
 	pthread_mutex_unlock(&w->listener->msg_queue->msgs_mutex);
 
-	const ssize_t wrote = write(w->listener->msg_queue->evfd, &(uint64_t){1}, sizeof(uint64_t));
-	if (-1 == wrote) {
-		perror("Writing to msg_queue notify eventfd");
-		// TODO: what?
+	if (err.msg && c->role == CON_ROLE_SERVER) {
+		// TODO: send a 500 error for this request and close
+		evhttp_con_set_status(c, 500);
+		evhttp_con_set_body(c, "Server is shutting down");
+		evhttp_con_set_header(c, EVHTTP_HDR_CONNECTION, .value="close");
+		c->connectionflags |= CON_CLOSE;
+		evhttp_con_respond(c);
+		goto close;
+	} else {
+		const ssize_t wrote = write(w->listener->msg_queue->evfd, &(uint64_t){1}, sizeof(uint64_t));
+		if (-1 == wrote) {
+			perror("Writing to msg_queue notify eventfd");
+			// TODO: what?
+		}
 	}
 
 	c = NULL; w = NULL; // ownership transferred to receiving thread
@@ -918,122 +934,75 @@ void accept_cb(struct ev_loop* loop, struct ev_io* _w, int revents) //<<<
 }
 
 //>>>
-#if 0
-void requests_ready_cb(struct ev_loop* loop, struct ev_async* w, int revents) //<<<
-{
-	struct listensock*		listensock = w->data;
-
-	printf("Main thread requests_ready_cb\n");
-
-	pthread_mutex_lock(&listensock->requests_mutex);
-	struct dlist	requests = listensock->requests;
-	listensock->requests.head = NULL;
-	listensock->requests.tail = NULL;
-	pthread_mutex_unlock(&listensock->requests_mutex);
-
-	struct con_state*	c;
-	while ((c = dlist_pop_head(&requests))) {
-		ts_log(c, "Got request in main thread: %ld --------------------------", pthread_self());
-		ts_log_output(c);
-	}
-}
-
-//>>>
-#endif
-void start_listen(struct msg_queue* q, const char* node, const char* service) //<<<
+evhttp_err start_listen(struct msg_queue* q, const char* node, const char* service) //<<<
 {
 	struct addrinfo		hints;
 	struct addrinfo*	res = NULL;
 	struct addrinfo*	addr = NULL;
 	struct listensock*	accept_watch = NULL;
-	//int					ev_pipe[2];
-	int					rc;
+	int					rc = 0;
+	evhttp_err			err = {NULL, EVHTTP_OK};
 
 	memset(&hints, 0, sizeof hints);
 	//hints.ai_family		= AF_INET;
 	hints.ai_socktype	= SOCK_STREAM;
 	hints.ai_protocol	= 0;
 	if ((rc = getaddrinfo(node, service, &hints, &res))) {
+		err = ERR("Could not resolve listen address", EVHTTP_ERR_LISTEN);
 		if (rc == EAI_SYSTEM) {
-			perror("Could not resolve listen address");
+			perror(err.msg);
 		} else {
-			fprintf(stderr, "Could not resolve address: %s\n", gai_strerror(rc));
+			fprintf(stderr, "%s: %s\n", err.msg, gai_strerror(rc));
 		}
-		exit(EXIT_FAILURE);
+		goto finally;
 	}
 
 	for (addr=res; addr; addr=addr->ai_next) {
 		int				listen_fd_http;
-		struct ev_io*	mainthread_ev_pipe_watch = malloc(sizeof *mainthread_ev_pipe_watch);	// LEAKS: we have no way to close the sockets these report on anyway
 		int				enabled = 1;
 
 		listen_fd_http = socket(addr->ai_family, addr->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK, addr->ai_protocol);
 		if (listen_fd_http == -1) {
-			perror("Could not create socket");
-			exit(EXIT_FAILURE);
+			err = ERR("Could not create socket", EVHTTP_ERR_SOCK);
+			perror(err.msg);
+			goto finally;
 		}
 
 		if (-1 == setsockopt(listen_fd_http, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(int))) {
-			perror("Could not set SO_REUSEADDR");
-			exit(EXIT_FAILURE);
+			err = ERR("Could not set SO_REUSEADDR", EVHTTP_ERR_SOCKOPT);
+			perror(err.msg);
+			goto finally;
 		}
 
 		if (-1 == bind(listen_fd_http, addr->ai_addr, addr->ai_addrlen)) {
-			perror("Could not bind to address");
-			exit(EXIT_FAILURE);
+			err = ERR("Could not bind to address", EVHTTP_ERR_BIND);
+			perror(err.msg);
+			goto finally;
 		}
 
 		if (-1 == listen(listen_fd_http, 1024)) {
-			perror("Could not listen on socket");
-			exit(EXIT_FAILURE);
+			err = ERR("Could not listen on socket", EVHTTP_ERR_LISTEN);
+			perror(err.msg);
+			goto finally;
 		}
-
-		/*
-		if (-1 == pipe(ev_pipe)) {
-			perror("Could not create ev_pipe");
-			exit(EXIT_FAILURE);
-		}
-		if (-1 == fcntl(ev_pipe[0], F_SETFL, O_NONBLOCK)) {
-			perror("Could not set O_NONBLOCK and FD_CLOEXEC on ev_pipe");
-			exit(EXIT_FAILURE);
-		}
-		if (-1 == fcntl(ev_pipe[0], F_SETFD, FD_CLOEXEC)) {
-			perror("Could not set O_NONBLOCK and FD_CLOEXEC on ev_pipe");
-			exit(EXIT_FAILURE);
-		}
-		if (-1 == fcntl(ev_pipe[1], F_SETFL, O_NONBLOCK)) {
-			perror("Could not set O_NONBLOCK and FD_CLOEXEC on ev_pipe");
-			exit(EXIT_FAILURE);
-		}
-		if (-1 == fcntl(ev_pipe[1], F_SETFD, FD_CLOEXEC)) {
-			perror("Could not set O_NONBLOCK and FD_CLOEXEC on ev_pipe");
-			exit(EXIT_FAILURE);
-		}
-		*/
 
 		accept_watch = malloc(sizeof *accept_watch);
 		memset(accept_watch, 0, sizeof *accept_watch);
 		accept_watch->msg_queue = q;
-		/*
-		pthread_mutex_init(&accept_watch->requests_mutex, NULL);
-		accept_watch->requests_loop = main_loop;
-		accept_watch->requests_ready.data = accept_watch;
-		*/
-		/*
-		ev_async_init(&accept_watch->requests_ready, requests_ready_cb);
-		*/
 		ev_io_init((struct ev_io*)accept_watch, accept_cb, listen_fd_http, EV_READ);
 		post_listensock(accept_watch);
-
-		//ev_async_start(main_loop, &accept_watch->requests_ready);
 	}
+
+finally:
 	freeaddrinfo(res);
+	return err;
 }
 
 //>>>
 void got_msg_cb(struct con_watch* w) //<<<
 {
-	struct con_state*	c = w->w.data;
+	evhttp_err			err = {NULL, EVHTTP_OK};
+	struct evhttp_con*	c = w->w.data;
 	struct obstack*		ob = obstack_pool_get(OBSTACK_POOL_SMALL);
 
 #undef MSG
@@ -1053,11 +1022,10 @@ void got_msg_cb(struct con_watch* w) //<<<
 	init_headers(&c->out_headers);
 	c->out_headers.dl.head = NULL;
 	c->out_headers.dl.tail = NULL;
-#undef ADD_STATIC_HEADER
 #define ADD_STATIC_HEADER(hdrname, strval) \
 	do { \
 		struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
-		h->field_name = HDR_OTHER; \
+		h->field_name = EVHTTP_HDR_OTHER; \
 		h->field_name_str = (unsigned char*)hdrname; \
 		h->field_name_str_len = sizeof(hdrname)-1; \
 		h->field_value.str = (unsigned char*)strval; \
@@ -1071,7 +1039,7 @@ void got_msg_cb(struct con_watch* w) //<<<
 	ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
 
 	struct header*	h = obstack_alloc(ob, sizeof(struct header));
-	h->field_name = HDR_CONTENT_LENGTH;
+	h->field_name = EVHTTP_HDR_CONTENT_LENGTH;
 	h->field_value.integer = body_len;
 	h->dl.next = h->dl.prev = NULL;
 	append_header(&c->out_headers, h);
@@ -1087,8 +1055,9 @@ void got_msg_cb(struct con_watch* w) //<<<
 	statusbase[4] = ' ';
 	obstack_grow(ob, REASON "\r\n", sizeof(REASON "\r\n")-1);
 
-	if (serialize_headers(ob, &c->out_headers)) {
-		ts_puts(c, "Error serializing headers", sizeof("Error serializing headers"));
+	err = serialize_headers(ob, &c->out_headers);
+	if (err.msg) {
+		ts_log(c, "Error serializing headers %s", err.msg);
 		close_con(w);
 		return;
 	}
@@ -1106,7 +1075,6 @@ void got_msg_cb(struct con_watch* w) //<<<
 	write_headers->notify_loop = NULL;
 	write_headers->notify_w = NULL;
 	dlist_append(&c->write_jobs, write_headers);
-	
 
 	struct write_job*		write_body = obstack_alloc(ob, sizeof *write_body);
 	memset(write_body, 0, sizeof *write_body);
@@ -1136,10 +1104,11 @@ void got_msg_cb(struct con_watch* w) //<<<
 	uint64_t	q2 = nanoseconds_process_cpu();
 
 	printf("Queued write job for io thread: %ld cycles\n", q2-q1);
+#undef ADD_STATIC_HEADER
 }
 
 //>>>
-struct msg_queue* new_msg_queue(int epollfd, msg_handler* cb) //<<<
+struct msg_queue* new_msg_queue(int epollfd, evhttp_msg_handler* cb) //<<<
 {
 	struct msg_queue*	q = malloc(sizeof *q);
 	struct epoll_event	ev;
@@ -1162,6 +1131,7 @@ failed:
 	if (q) {
 		if (q->evfd)
 			close(q->evfd);
+		pthread_mutex_destroy(&q->msgs_mutex);
 		free(q);
 		q = NULL;
 	}
@@ -1169,37 +1139,57 @@ failed:
 }
 
 //>>>
-int main(int argc, char** argv) //<<<
+void evhttp_handle_events(struct evhttp* evh) //<<<
 {
-	pthread_t		tid;
-	pthread_attr_t	attr;
 #define MAX_EVENTS	10
 	struct epoll_event	events[MAX_EVENTS];
-	struct epoll_event	ev;
-	int					rc;
-	int					io_thread_started;
-
-	main_loop_epoll_fd = epoll_create1(0);
-	if (-1 == main_loop_epoll_fd) {
-		perror("Could not create epoll instance");
-		exit(EXIT_FAILURE);
+	const int nfds = epoll_wait(evh->epollfd, events, MAX_EVENTS, 0);
+	if (-1 == nfds) {
+		perror("epoll_wait");
+		goto failed;
 	}
 
-	io_thread_started = eventfd(0, EFD_CLOEXEC);
-	ev.events = EPOLLIN;
-	ev.data.fd = io_thread_started;
-	if (epoll_ctl(main_loop_epoll_fd, EPOLL_CTL_ADD, io_thread_started, &ev) == -1) {
-		perror("epoll_ctl: io_thread_started");
-		exit(EXIT_FAILURE);
+	for (int i=0; i<nfds; i++) {
+		uint64_t	val;
+		struct dlist		msgs;
+		struct con_watch*	w;
+
+		if (events[i].data.fd != evh->q->evfd) {
+			// Not an fd we recognise - should only have the message queue eventfd registered
+			// TODO: what?
+			continue;
+		}
+
+		if (-1 == read(events[i].data.fd, &val, sizeof val)) {
+			if (errno == EAGAIN) continue;
+			perror("Read msg_queue evfd");
+			// TODO: what?
+			goto failed;
+		}
+		if (val == 0) continue;
+		printf("Woke up for msg_queue fd %d with %ld events\n", events[i].data.fd, val);
+
+		pthread_mutex_lock(&evh->q->msgs_mutex);
+		msgs = evh->q->msgs;
+		evh->q->msgs.head = evh->q->msgs.tail = NULL;
+		pthread_mutex_unlock(&evh->q->msgs_mutex);
+
+		while ((w = dlist_pop_head(&msgs)))
+			evh->q->cb((struct evhttp_con*)(w->w.data));
 	}
 
-	main_loop = ev_default_loop(EVFLAG_AUTO);
+failed:
+	return;
+}
 
-	if (main_loop == NULL) {
-		fprintf(stderr, "Could not initialize default libev loop\n");
-		return 1;
-	}
- 
+//>>>
+int autoinit_io_thread() // Start the io thread if it hasn't been <<<
+{
+	int					io_thread_started = -1;
+	int					rc = 0;
+	pthread_t			tid;
+	pthread_attr_t		attr;
+
 #define PTHREAD_OK(call, msg) \
 	do { \
 		__typeof__(call) rc = call; \
@@ -1210,90 +1200,583 @@ int main(int argc, char** argv) //<<<
 		} \
 	} while(0);
 
-	PTHREAD_OK(pthread_attr_init(&attr), "pthread_attr_init failed");
-	PTHREAD_OK(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED), "pthread_attr_setdetachstate failed");
-	PTHREAD_OK(pthread_create(&tid, &attr, thread_start, &io_thread_started), "pthread_create failed");
-	PTHREAD_OK(pthread_attr_destroy(&attr), "pthread_attr_destroy failed");
+	if (autoinit_done) return 0;
 
-#if 0
-	// Wait for the io thread to start up.  Since the only fd registed so far is io_thread_started, we just wait
-	// for anything to be ready
-	do {
-		nfds = epoll_wait(main_loop_epoll_fd, events, MAX_EVENTS, 500);
-		if (-1 == nfds) {
-			perror("epoll_wait for io_thread_started");
-			exit(EXIT_FAILURE);
-		}
-	} while (nfds == 0);
-#endif
-	uint64_t val;
-	rc = read(io_thread_started, &val, sizeof val);
-	if (-1 == rc) {
-		perror("Read io_thread_started eventfd");
-		exit(EXIT_FAILURE);
-	}
-	val -= 256;
-	printf("Got io_thread startup result: %ld\n", val);
-	if (-1 == val) {
-		fprintf(stderr, "io thread startup failed\n");
-		goto failed;
-	}
-	close(io_thread_started);
-
-	// Create a queue for receiving messages from our listening sockets
-	struct msg_queue*	q = new_msg_queue(main_loop_epoll_fd, got_msg_cb);
-
-	pthread_rwlock_wrlock(&msg_queues_rwlock);
-	dlist_append(&msg_queues, q);
-	pthread_rwlock_unlock(&msg_queues_rwlock);
-
-	start_listen(q, "0.0.0.0", "1080");
-	start_listen(q, "::1", "1080");
-
-	//ev_run(main_loop, 0);
-	while (1) {
-		const int nfds = epoll_wait(main_loop_epoll_fd, events, MAX_EVENTS, -1);
-		if (-1 == nfds) {
-			perror("epoll_wait");
+	pthread_mutex_lock(&autoinit_mutex);
+	if (!autoinit_done) {
+		io_thread_started = eventfd(0, EFD_CLOEXEC);
+		if (-1 == io_thread_started) {
+			perror("eventfd io_thread_started");
 			goto failed;
 		}
-		pthread_rwlock_rdlock(&msg_queues_rwlock);
-		for (int i=0; i<nfds; i++) {
-			struct msg_queue*	q = dlist_head(&msg_queues);
-			uint64_t			val;
+		PTHREAD_OK(pthread_attr_init(&attr), "pthread_attr_init failed");
+		PTHREAD_OK(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED), "pthread_attr_setdetachstate failed");
+		PTHREAD_OK(pthread_create(&tid, &attr, thread_start, &io_thread_started), "pthread_create failed");
+		PTHREAD_OK(pthread_attr_destroy(&attr), "pthread_attr_destroy failed");
 
-			if (-1 == read(events[i].data.fd, &val, sizeof val)) {
-				if (errno == EAGAIN) continue;
-				perror("Read msg_queue evfd");
-				// TODO: what?
-				goto poll_error;
-			}
-			if (val == 0) continue;
-			printf("Woke up for msg_queue fd %d with %ld events\n", events[i].data.fd, val);
-
-			// Search the msg queues for this fd and dispatch any messages queued for it
-			while (q) {
-				if (events[i].data.fd == q->evfd) {
-					struct dlist		msgs;
-					struct con_watch*	w;
-
-					pthread_mutex_lock(&q->msgs_mutex);
-					msgs = q->msgs;
-					q->msgs.head = q->msgs.tail = NULL;
-					pthread_mutex_unlock(&q->msgs_mutex);
-
-					while ((w = dlist_pop_head(&msgs)))
-						q->cb(w);
-				}
-				q = q->dl.next;
-			}
+		uint64_t val;
+		rc = read(io_thread_started, &val, sizeof val);
+		if (-1 == rc) {
+			perror("Read io_thread_started eventfd");
+			exit(EXIT_FAILURE);
 		}
-poll_error:
-		pthread_rwlock_unlock(&msg_queues_rwlock);
+		rc = val - 256;
+		printf("Got io_thread startup result: %d\n", rc);
+		if (-1 == rc) {
+			fprintf(stderr, "io thread startup failed\n");
+			goto failed;
+		}
+		autoinit_done = 1;
 	}
 
 failed:
-	pthread_exit(NULL);
+	if (io_thread_started != -1) close(io_thread_started);
+	pthread_mutex_unlock(&autoinit_mutex);
+
+	return rc;
+}
+
+//>>>
+evhttp_err evhttp_server(evhttp_msg_handler* cb, struct evhttp** evh) //<<<
+{
+	struct evhttp*		new_evh = NULL;
+
+	if (-1 == autoinit_io_thread()) {
+		goto failed;
+	}
+
+	new_evh = malloc(sizeof *new_evh);
+	memset(new_evh, 0, sizeof *new_evh);
+
+	new_evh->epollfd = epoll_create1(0);
+	if (-1 == new_evh->epollfd) {
+		perror("Could not create epoll instance");
+		exit(EXIT_FAILURE);
+	}
+
+	// Create a queue for receiving messages from our listening sockets
+	new_evh->q = new_msg_queue(new_evh->epollfd, cb);
+
+	*evh = new_evh;
+	return ERR(NULL, EVHTTP_OK);
+
+failed:
+	if (new_evh) {
+		free(new_evh);
+		new_evh = NULL;
+	}
+	return ERR("Could not create new evhttp_server");
+}
+
+//>>>
+evhttp_err evhttp_server_listen(struct evhttp* evh, const char* node, const char* service) //<<<
+{
+	return start_listen(evh->q, node, service);
+}
+
+//>>>
+int evhttp_fd(struct evhttp* evh) //<<<
+{
+	return evh->epollfd;
+}
+
+//>>>
+size_t evhttp_con_get_body_len(struct evhttp_con* con) //<<<
+{
+	return con->body_size;
+}
+
+//>>>
+const unsigned char* evhttp_con_get_body(struct evhttp_con* con) //<<<
+{
+	return con->body;
+}
+
+//>>>
+enum evhttp_method evhttp_con_get_method(struct evhttp_con* con) //<<<
+{
+	return con->method;
+}
+
+//>>>
+evhttp_err evhttp_con_set_status_(struct evhttp_con_set_status_args args) //<<<
+{
+	struct evhttp_con*	c = args.con;
+	evhttp_err			err = {NULL, EVHTTP_OK};
+
+	if (args.status < 100 || args.status >= 600) {
+		err = ERR("Status must be in the range [100, 600]", EVHTTP_ERR_INVALID);
+		goto finally;
+	}
+
+	c->status_numeric = args.status;
+
+	if (args.reason.bytes)
+		c->reason = args.reason;
+
+finally:
+	return err;
+}
+
+//>>>
+#if 0
+int evhttp_con_set_body(struct evhttp_con* con, const char* content_type, const char* body, ssize_t body_len) //<<<
+{
+	struct obstack*	ob = obstack_pool_get(OBSTACK_POOL_SMALL);
+
+	// Assemble body
+	obstack_grow(ob, "Bad Request", sizeof("Bad Request")-1);
+	const size_t			body_len = obstack_object_size(ob);
+	const unsigned char*	body = obstack_finish(ob);
+
+	init_headers(&c->out_headers);
+#define ADD_STATIC_HEADER(hdrname, strval) \
+	do { \
+		struct header*	h = obstack_alloc(ob, sizeof(struct header)); \
+		h->field_name = EVHTTP_HDR_OTHER; \
+		h->field_name_str = (unsigned char*)hdrname; \
+		h->field_name_str_len = sizeof(hdrname)-1; \
+		h->field_value.str = (unsigned char*)strval; \
+		append_header(&c->out_headers, h); \
+	} while(0);
+
+	ADD_STATIC_HEADER("Server",			"evhttp 0.1");
+	// TODO: Date, etc
+	ADD_STATIC_HEADER("Connection",		"close");
+	ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
+
+	struct header*	h = obstack_alloc(ob, sizeof(struct header));
+	h->field_name = EVHTTP_HDR_CONTENT_LENGTH;
+	h->field_value.integer = body_len;
+	append_header(&c->out_headers, h);
+
+	obstack_grow(ob, "HTTP/1.1 400 Bad Request\r\n", sizeof("HTTP/1.1 400 Bad Request\r\n")-1);
+	if (serialize_headers(ob, &c->out_headers)) {
+		ts_puts(c, "Error serializing headers", sizeof("Error serializing headers"));
+		goto close;
+	}
+
+	const size_t			hdrbuf_len = obstack_object_size(ob);
+	const unsigned char*	hdrbuf = obstack_finish(ob);
+	struct write_job*		write_headers = obstack_alloc(ob, sizeof *write_headers);
+	memset(write_headers, 0, sizeof *write_headers);
+	write_headers->source = WRITE_SOURCE_BUF;
+	write_headers->src.buf.len = hdrbuf_len;
+	write_headers->src.buf.buf = hdrbuf;
+	write_headers->action = WRITE_COMPLETE_IGNORE;
+	dlist_append(&c->write_jobs, write_headers);
+
+	struct write_job*		write_body = obstack_alloc(ob, sizeof *write_body);
+	memset(write_body, 0, sizeof *write_body);
+	write_body->source = WRITE_SOURCE_BUF;
+	write_body->src.buf.len = body_len;
+	write_body->src.buf.buf = body;
+	write_body->action = WRITE_COMPLETE_CLOSE;
+	write_body->ob = ob;
+	write_body->free_cb = &release_write_job_obstack;
+	dlist_append(&c->write_jobs, write_body);
+
+	if (w->w.events & EV_READ)
+		modify_io_evmask(loop, (struct ev_io*)w, 0, EV_READ);
+
+	ts_puts(c, "Constucted and queued response", sizeof("Constucted and queued response")-1);
+	con_io_cb(loop, (struct ev_io*)w, EV_WRITE);
+#undef ADD_STATIC_HEADER
+}
+
+//>>>
+#endif
+//evhttp_err evhttp_con_set_body(struct evhttp_con* con, const char* content_type, const char* body, ssize_t body_len, evhttp_releaser* free_body)
+evhttp_err evhttp_con_set_body_(struct evhttp_con_set_body_args args) //<<<
+{
+	evhttp_err			err = {NULL, EVHTTP_OK};
+	struct evhttp_con*	con = args.con;
+	const char*			content_type = args.content_type ? args.content_type : "text/plain";
+
+	if (!con) {
+		err = ERR("con is NULL", EVHTTP_ERR_INVALID);
+		goto finally;
+	}
+
+	if (con->body_write_job) {
+		// There is already a body writer queued, replace it
+		if (con->body_write_job->free_cb) {
+			void*	free_cdata = con->body_write_job->free_cdata;
+			if (free_cdata == NULL) free_cdata = con->body_write_job;
+			con->body_write_job->free_cb(free_cdata);
+		}
+		con->body_write_job = NULL;
+	}
+
+	switch (args.source) {
+		case EVHTTP_SOURCE_BUF:
+			{
+				const char*			body = args.buf.bytes;
+				ssize_t				body_len = args.buf.len ? args.buf.len : -1;
+				evhttp_releaser*	free_body = args.buf.free;
+
+				if (body == NULL)
+					goto finally;
+
+				if (body_len == -1)
+					body_len = strlen(body);
+
+				EVHTTP_CHECK(finally, err, evhttp_con_set_header(con, EVHTTP_HDR_OTHER, "Content-Type", .value=content_type));
+				EVHTTP_CHECK(finally, err, evhttp_con_set_header(con, EVHTTP_HDR_CONTENT_LENGTH, .value.integer=body_len));
+
+				con->body_write_job = obstack_alloc(con->ob, sizeof(struct write_job));
+				memset(con->body_write_job, 0, sizeof(struct write_job));
+				con->body_write_job->source = WRITE_SOURCE_BUF;
+				con->body_write_job->src.buf.len = body_len;
+				con->body_write_job->src.buf.buf = (const unsigned char*)body;
+				con->body_write_job->action = WRITE_COMPLETE_IGNORE;
+				con->body_write_job->free_cb = free_body;
+				con->body_write_job->free_cdata = (void*)body;
+			}
+			break;
+
+		case EVHTTP_SOURCE_STREAM:
+			err = ERR("EVHTTP_SOURCE_STREAM not implemented yet", EVHTTP_ERR_UNIMPLEMENTED);
+			break;
+
+		default:
+			err = ERR("Invalid source", EVHTTP_ERR_INVALID);
+			break;
+	}
+
+finally:
+	return err;
+}
+
+//>>>
+int evhttp_con_target_match(struct evhttp_con* con, const char* target_pattern) //<<<
+{
+	// TODO: make this smarter
+	return strcmp(target_pattern, (const char*)con->target) == 0;
+}
+
+//>>>
+evhttp_err append_statusline(struct obstack* ob, const unsigned char* http_ver, int status, struct evhttp_buf* reason) //<<<
+{
+	evhttp_err	err = {NULL, EVHTTP_OK};
+	const int	restore_size = obstack_object_size(ob);
+
+	if (status < 100 || status >= 600)
+		return ERR("Status must be in the range [100, 600]", EVHTTP_ERR_INVALID);
+
+	obstack_grow(ob, http_ver, strlen((const char*)http_ver));
+	obstack_1grow(ob, ' ');
+	obstack_1grow(ob, '0' + ((status / 100) % 10));
+	obstack_1grow(ob, '0' + ((status / 10)  % 10));
+	obstack_1grow(ob, '0' + ( status        % 10));
+	obstack_1grow(ob, ' ');
+	if (reason->bytes) {
+		const size_t	len = reason->len == -1 ? strlen(reason->bytes) : reason->len;
+
+		if (len == 0) {
+			err = ERR("Reason cannot be blank", EVHTTP_ERR_INVALID);
+			goto finally;
+		}
+		obstack_grow(ob, reason->bytes, len);
+	} else { // Provide a standard reason for status <<<
+		const char*	default_reason = NULL;
+		size_t		default_reason_len;
+
+#define DEFAULT_REASON(msg) do {default_reason=msg; default_reason_len=sizeof(msg)-1;} while(0)
+		switch (status) {
+			case 100: DEFAULT_REASON("Continue");							break;
+			case 101: DEFAULT_REASON("Switching Protocols");				break;
+			case 102: DEFAULT_REASON("Processing");							break;
+			case 103: DEFAULT_REASON("Early Hints");						break;
+
+			case 200: DEFAULT_REASON("OK");									break;
+			case 201: DEFAULT_REASON("Created");							break;
+			case 202: DEFAULT_REASON("Accepted");							break;
+			case 203: DEFAULT_REASON("Non-Authoritative Information");		break;
+			case 204: DEFAULT_REASON("No Content");							break;
+			case 205: DEFAULT_REASON("Reset Content");						break;
+			case 206: DEFAULT_REASON("Partial Content");					break;
+			case 207: DEFAULT_REASON("Multi-Status");						break;
+			case 208: DEFAULT_REASON("Already Reported");					break;
+			case 226: DEFAULT_REASON("IM Used");							break;
+
+			case 300: DEFAULT_REASON("Multiple Choices");					break;
+			case 301: DEFAULT_REASON("Moved Permanently");					break;
+			case 302: DEFAULT_REASON("Found");								break;
+			case 303: DEFAULT_REASON("See Other");							break;
+			case 304: DEFAULT_REASON("Not Modified");						break;
+			case 305: DEFAULT_REASON("Use Proxy");							break;
+			case 306: DEFAULT_REASON("Switch Proxy");						break;
+			case 307: DEFAULT_REASON("Temporary Redirect");					break;
+			case 308: DEFAULT_REASON("Permanent Redirect");					break;
+
+			case 400: DEFAULT_REASON("Bad Request");						break;
+			case 401: DEFAULT_REASON("Unauthorized");						break;
+			case 402: DEFAULT_REASON("Payment Required");					break;
+			case 403: DEFAULT_REASON("Forbidden");							break;
+			case 404: DEFAULT_REASON("Not Found");							break;
+			case 405: DEFAULT_REASON("Method Not Allowed");					break;
+			case 406: DEFAULT_REASON("Not Acceptable");						break;
+			case 407: DEFAULT_REASON("Proxy Authentication Required");		break;
+			case 408: DEFAULT_REASON("Request Timeout");					break;
+			case 409: DEFAULT_REASON("Conflict");							break;
+			case 410: DEFAULT_REASON("Gone");								break;
+			case 411: DEFAULT_REASON("Length Required");					break;
+			case 412: DEFAULT_REASON("Precondition Failed");				break;
+			case 413: DEFAULT_REASON("Payload Too Large");					break;
+			case 414: DEFAULT_REASON("URI Too Long");						break;
+			case 415: DEFAULT_REASON("Unsupported Media Type");				break;
+			case 416: DEFAULT_REASON("Range Not Satisfiable");				break;
+			case 417: DEFAULT_REASON("Expectation Failed");					break;
+			case 418: DEFAULT_REASON("I'm a teapot");						break;
+			case 421: DEFAULT_REASON("Misdirected Request");				break;
+			case 422: DEFAULT_REASON("Unprocessable Entity");				break;
+			case 423: DEFAULT_REASON("Locked");								break;
+			case 424: DEFAULT_REASON("Failed Dependency");					break;
+			case 425: DEFAULT_REASON("Too Early");							break;
+			case 426: DEFAULT_REASON("Upgrade Required");					break;
+			case 428: DEFAULT_REASON("Precondition Required");				break;
+			case 429: DEFAULT_REASON("Too Many Requests");					break;
+			case 431: DEFAULT_REASON("Request Header Fields Too Large");	break;
+			case 451: DEFAULT_REASON("Unavailable For Legal Reasons");		break;
+
+			case 500: DEFAULT_REASON("Internal Server Error");				break;
+			case 501: DEFAULT_REASON("Not Implemented");					break;
+			case 502: DEFAULT_REASON("Bad Gateway");						break;
+			case 503: DEFAULT_REASON("Service Unavailable");				break;
+			case 504: DEFAULT_REASON("Gateway Timeout");					break;
+			case 505: DEFAULT_REASON("HTTP Version Not Supported");			break;
+			case 506: DEFAULT_REASON("Variant Also Negotiates");			break;
+			case 507: DEFAULT_REASON("Insufficient Storage");				break;
+			case 508: DEFAULT_REASON("Loop Detected");						break;
+			case 510: DEFAULT_REASON("Not Extended");						break;
+			case 511: DEFAULT_REASON("Network Authentication Required");	break;
+
+			default:
+				     if (status <= 199)	DEFAULT_REASON("Informational");
+				else if (status <= 299)	DEFAULT_REASON("Success");
+				else if (status <= 399)	DEFAULT_REASON("Redirection");
+				else if (status <= 499)	DEFAULT_REASON("Client Error");
+				else if (status <= 599)	DEFAULT_REASON("Server Error");
+		}
+#undef DEFAULT_REASON
+		obstack_grow(ob, default_reason, default_reason_len);
+		//>>>
+	}
+	obstack_grow(ob, "\r\n", 2);
+
+finally:
+	if (err.msg)
+		obstack_free(ob, obstack_base(ob) + restore_size);
+
+	return err;
+}
+
+//>>>
+evhttp_err evhttp_con_set_header_(struct evhttp_con_set_header_args args) //<<<
+{
+	evhttp_err			err = {NULL, EVHTTP_OK};
+	struct evhttp_con*	con = args.con;
+	struct header*		h = obstack_alloc(con->ob, sizeof *h);
+
+	h->field_name = args.name;
+	if (h->field_name == EVHTTP_HDR_OTHER) {
+		if (args.name_str.bytes == NULL) {
+			err = ERR(".name_str must be set if .name == EVHTTP_HDR_OTHER", EVHTTP_ERR_INVALID);
+			goto finally;	
+		}
+		h->field_name_str = (unsigned char*)strdup(args.name_str.bytes);	// TODO: fix leak
+		h->field_name_str_len = args.name_str.len > 0 ? args.name_str.len : strlen((char*)h->field_name_str);
+		//h->field_name_str_free = args.name_str.free; // TODO
+	}
+
+	switch (h->field_name) {
+		case EVHTTP_HDR_OTHER:
+		case EVHTTP_HDR_HOST:
+		case EVHTTP_HDR_USER_AGENT:
+			h->field_value.str = (unsigned char*)strdup(args.value.str.bytes);	// TODO: fix leak
+			//h->field_value.str_len = args.value.str.len;		// TODO
+			//h->field_value.str_free = args.value.str.free;	// TODO
+			break;
+
+		case EVHTTP_HDR_CONTENT_LENGTH:
+			h->field_value.integer = args.value.integer;
+			break;
+
+		case EVHTTP_HDR_CONTENT_TYPE:
+		case EVHTTP_HDR_TRANSFER_ENCODING:
+		case EVHTTP_HDR_TE:
+		case EVHTTP_HDR_SET_COOKIE:
+		case EVHTTP_HDR_COOKIE:
+		case EVHTTP_HDR_CONNECTION:
+		case EVHTTP_HDR_UPGRADE:
+			err = ERR("Header not implemented yet", EVHTTP_ERR_UNIMPLEMENTED);
+			goto finally;
+
+		default:
+			err = ERR("Invalid header", EVHTTP_ERR_INVALID);
+			goto finally;
+	}
+
+finally:
+	if (err.msg)
+		obstack_free(con->ob, h);
+
+	return err;
+}
+
+//>>>
+evhttp_err evhttp_con_respond(struct evhttp_con* con) //<<<
+{
+	evhttp_err			err = {NULL, EVHTTP_OK};
+
+#define ADD_STATIC_HEADER(hdrname, strval) \
+	do { \
+		struct header*	h = obstack_alloc(con->ob, sizeof(struct header)); \
+		h->field_name = EVHTTP_HDR_OTHER; \
+		h->field_name_str = (unsigned char*)hdrname; \
+		h->field_name_str_len = sizeof(hdrname)-1; \
+		h->field_value.str = (unsigned char*)strval; \
+		append_header(&con->out_headers, h); \
+	} while(0);
+
+	if (con->body_write_job) {
+		const struct write_job*	j = con->body_write_job;
+		if (j->source == WRITE_SOURCE_BUF) {
+			struct header*	h = obstack_alloc(con->ob, sizeof(struct header));
+			h->field_name = EVHTTP_HDR_CONTENT_LENGTH;
+			h->field_value.integer = j->src.buf.len;
+			append_header(&con->out_headers, h);
+		} else {
+			// TODO: Transfer-Encoding: chunked
+			err = ERR("Transfer-Encoding: chunked is not supported yet", EVHTTP_ERR_UNIMPLEMENTED);
+			goto finally;
+		}
+	} else {
+		struct header*	h = obstack_alloc(con->ob, sizeof(struct header));
+		h->field_name = EVHTTP_HDR_CONTENT_LENGTH;
+		h->field_value.integer = 0;
+		append_header(&con->out_headers, h);
+	}
+
+	ADD_STATIC_HEADER("Server",			"evhttp 0.1");
+	// TODO: Date, etc
+	//ADD_STATIC_HEADER("Connection",	"close");
+	//ADD_STATIC_HEADER("Content-Type",	"text/plain;charset=utf-8");
+
+	EVHTTP_CHECK(finally, err, append_statusline(con->ob, con->http_ver, con->status_numeric, &con->reason));
+	EVHTTP_CHECK(finally, err, serialize_headers(con->ob, &con->out_headers));
+
+	const size_t			hdrbuf_len = obstack_object_size(con->ob);
+	const unsigned char*	hdrbuf = obstack_finish(con->ob);
+	enum write_complete_action	final_action = con->connectionflags & CON_CLOSE ? WRITE_COMPLETE_CLOSE : WRITE_COMPLETE_IGNORE;
+	struct write_job*		write_headers = obstack_alloc(con->ob, sizeof *write_headers);
+	memset(write_headers, 0, sizeof *write_headers);
+	write_headers->source = WRITE_SOURCE_BUF;
+	write_headers->src.buf.len = hdrbuf_len;
+	write_headers->src.buf.buf = hdrbuf;
+	write_headers->action = WRITE_COMPLETE_IGNORE;
+	dlist_append(&con->write_jobs, write_headers);
+
+	if (con->body_write_job) {
+		if (
+				(con->role == CON_ROLE_SERVER && con->method == EVHTTP_METHOD_HEAD) ||
+				(con->role == CON_ROLE_SERVER && con->method == EVHTTP_METHOD_CONNECT) ||
+				(con->status_numeric >= 100 && con->status_numeric <= 199) ||
+				con->status_numeric == 204 ||
+				con->status_numeric == 304
+		) {
+			err = ERR("Body is not allowed for this type of response", EVHTTP_ERR_INVALID);
+			goto finally;
+		}
+
+		con->body_write_job->action = final_action;
+		dlist_append(&con->write_jobs, con->body_write_job);
+	} else {
+		write_headers->action = final_action;
+	}
+
+	/*
+	if (con->w->w.events & EV_READ)
+		modify_io_evmask(con->w->loop, (struct ev_io*)con->w, 0, EV_READ);
+		*/
+
+	con_io_cb(con->w->loop, (struct ev_io*)con->w, EV_WRITE);
+	ts_puts(con, STATIC_STR("Constucted and queued response"));
+#undef ADD_STATIC_HEADER
+
+finally:
+	return err;
+}
+
+//>>>
+evhttp_err evhttp_close(struct evhttp** evh) //<<<
+{
+	evhttp_err			err = {NULL, EVHTTP_OK};
+
+	if (*evh == NULL) goto finally;
+
+	// TODO: everything
+
+	if ((*evh)->epollfd > 0) {
+		close((*evh)->epollfd);
+		(*evh)->epollfd = -1;
+	}
+
+	if ((*evh)->q) {
+		struct msg_queue*	q = (*evh)->q;
+		struct listensock*	sock = NULL;
+
+		pthread_mutex_lock(&listensock_mutex);
+		sock = g_listensock_active.head;
+		while (sock) {
+			struct listensock*	s = sock;
+			if (sock->msg_queue == q) {
+				ev_io_stop(io_thread_loop, &sock->accept_watcher);
+				close(sock->accept_watcher.fd);
+				//free(sock->accept_watcher);
+				//sock->accept_watcher = NULL;
+				g_listensock_active.head = sock->next;
+
+				pthread_mutex_lock(&sock->msg_queue->msgs_mutex);
+				close(sock->msg_queue->evfd);
+				sock->msg_queue->evfd = -1;
+				sock->msg_queue->cb = NULL;
+				pthread_mutex_unlock(&sock->msg_queue->msgs_mutex);
+			}
+
+			sock = sock->next;
+
+			// TODO: reference-count the listensock struct, dec the listener ref here
+			free(s);
+			s = NULL;
+		}
+		if (g_listensock_active.tail) {
+			g_listensock_active.tail->next = g_listensock_queue.head;
+			g_listensock_active.tail = g_listensock_queue.tail;
+		} else {
+			g_listensock_active.head = g_listensock_queue.head;
+			g_listensock_active.tail = g_listensock_queue.tail;
+		}
+		g_listensock_queue.head = g_listensock_queue.tail = NULL;
+		pthread_mutex_unlock(&listensock_mutex);
+		pthread_mutex_lock(&q->msgs_mutex);
+		(*evh)->q = NULL;
+		pthread_mutex_unlock(&q->msgs_mutex);
+		pthread_mutex_destroy(&q->msgs_mutex);
+		if (q->evfd > 0) {
+			close(q->evfd);
+			q->evfd = -1;
+		}
+		free(q);
+		q = NULL;
+	}
+
+	free(*evh);
+	*evh = NULL;
+
+finally:
+	return err;
 }
 
 //>>>
